@@ -210,7 +210,8 @@
       "baseUrl": "Base URL",
       "model": "Model",
       "subtitleReasoningEffort": "Subtitle reasoning effort",
-      "renameReasoningEffort": "Rename reasoning effort"
+      "renameReasoningEffort": "Rename reasoning effort",
+      "minimalFrequencyTier": "Minimalistic frequency cutoff"
     },
     "navigation": "Settings sections",
     "intro": "Choose your storage, subtitle preferences, and connected services.",

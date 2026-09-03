@@ -206,7 +206,8 @@
       "baseUrl": "基础 URL",
       "model": "模型",
       "subtitleReasoningEffort": "字幕推理强度",
-      "renameReasoningEffort": "重命名推理强度"
+      "renameReasoningEffort": "重命名推理强度",
+      "minimalFrequencyTier": "极简模式词频阈值"
     },
     "navigation": "设置分类",
     "intro": "选择存储位置、字幕偏好和服务。",
