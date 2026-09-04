@@ -948,3 +948,5 @@ footer { font-size: 12px; line-height: 1.6; text-align: left; }
 .renameHelpContent p { color: var(--muted-foreground); }
 .renameHelpContent ol { padding-left: var(--space-5); }
 .renameHelpContent li + li { margin-top: var(--space-3); }
+
+.languageProbeSkeleton { width: 18px; height: 18px; flex: 0 0 auto; }

@@ -15,7 +15,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -31,7 +31,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from guessit import guessit
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -42,6 +42,7 @@ from backend.config_storage import config_path
 from backend.media_range import MediaReadError, remote_media
 from backend.subtitle_sync import sync_remote
 from backend.embedded_subtitles import EmbeddedSubtitle, SparseReader, extract_indexed
+from backend.embedded_metadata import EmbeddedSubtitleMetadata, probe_embedded_subtitles
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 CONFIG_PATH = config_path(Path.home())
@@ -400,6 +401,7 @@ class MediaSource(Protocol):
     def sidecars(self, video_path: str) -> list[FileEntry]: ...
     def file_info(self, relative: str) -> FileEntry: ...
     def exists(self, relative: str) -> bool: ...
+    def read_range(self, relative: str, start: int, end: int, timeout: float | None = None) -> bytes: ...
     def moviehash(self, relative: str, size: int) -> str: ...
     def read_small(self, relative: str, limit: int = MAX_SUBTITLE_BYTES) -> bytes: ...
     def sync_input(self, relative: str) -> ContextManager[str]: ...
@@ -598,6 +600,11 @@ def detect_sidecar_language_from_name(video_name: str, subtitle_name: str) -> st
             continue
         selected.append((start, code))
         claimed.append((start, end))
+    # Minimalistic ASS contains English dialogue plus target-language glosses,
+    # so it must not be reused as a complete target-language source.
+    if ".minimal." in markers and PurePosixPath(subtitle_name).suffix.casefold() == ".ass" and selected:
+        if not any(code == "en" for _, code in selected):
+            selected.append((len(markers), "en"))
     return "+".join(code for _, code in sorted(selected)) or None
 
 
@@ -853,10 +860,11 @@ class WebDAV:
             return False
         raise PipelineError(f"WebDAV could not check the output path ({response.status_code})")
 
-    def _open_media(self, relative: str, headers: dict[str, str]) -> httpx.Response:
+    def _open_media(self, relative: str, headers: dict[str, str], timeout: float | None = None) -> httpx.Response:
         url = self.url_for(relative)
         try:
-            request = self.client.build_request("GET", url, headers=headers)
+            options = {"timeout": timeout} if timeout is not None else {}
+            request = self.client.build_request("GET", url, headers=headers, **options)
             response = self.client.send(request, stream=True, follow_redirects=False)
         except httpx.HTTPError as exc:
             raise PipelineError("WebDAV media request failed") from exc
@@ -868,7 +876,7 @@ class WebDAV:
                 raise PipelineError("WebDAV returned an unsafe media redirect")
             try:
                 # The CDN request deliberately uses a client with no WebDAV auth.
-                request = self.media_client.build_request("GET", target.geturl(), headers=headers)
+                request = self.media_client.build_request("GET", target.geturl(), headers=headers, **options)
                 response = self.media_client.send(request, stream=True, follow_redirects=False)
             except httpx.HTTPError as exc:
                 raise PipelineError("WebDAV media redirect failed") from exc
@@ -877,8 +885,8 @@ class WebDAV:
                 raise PipelineError("WebDAV media redirected more than once")
         return response
 
-    def read_range(self, relative: str, start: int, end: int) -> bytes:
-        response = self._open_media(relative, {"Range": f"bytes={start}-{end}"})
+    def read_range(self, relative: str, start: int, end: int, timeout: float | None = None) -> bytes:
+        response = self._open_media(relative, {"Range": f"bytes={start}-{end}"}, timeout=timeout)
         try:
             if response.status_code != 206:
                 raise PipelineError("WebDAV server does not support required byte ranges")
@@ -1069,6 +1077,21 @@ class LocalStorage:
 
     def exists(self, relative: str) -> bool:
         return self._path(relative).exists()
+
+    def read_range(self, relative: str, start: int, end: int, timeout: float | None = None) -> bytes:
+        del timeout
+        if start < 0 or end < start:
+            raise PipelineError("Invalid local byte range")
+        path = self._path(relative, must_exist=True)
+        try:
+            with path.open("rb") as media:
+                media.seek(start)
+                data = media.read(end - start + 1)
+        except OSError as exc:
+            raise PipelineError("Could not read the local video range") from exc
+        if len(data) != end - start + 1:
+            raise PipelineError("Local video range was incomplete")
+        return data
 
     def moviehash(self, relative: str, size: int) -> str:
         path = self._path(relative, must_exist=True)
@@ -1881,7 +1904,6 @@ def translate_srt(
         max_retries=2,
         timeout=90,
     )
-    usage = {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
     translations: dict[int, Any] = {}
 
     def translate_batch(batch: list[tuple[int, srt.Subtitle]]) -> tuple[dict[int, Any], dict[str, int]]:
@@ -2212,6 +2234,83 @@ WEBDAV: WebDAV | None = None
 OPENSUBTITLES: OpenSubtitles | None = None
 
 
+EMBEDDED_METADATA_CACHE_TTL_SECONDS = 24 * 60 * 60
+EMBEDDED_METADATA_FAILURE_TTL_SECONDS = 60
+EMBEDDED_METADATA_CACHE_MAX_ENTRIES = 1024
+EmbeddedMetadataCacheKey = tuple[int, str, int, str | None]
+EMBEDDED_METADATA_CACHE: OrderedDict[
+    EmbeddedMetadataCacheKey,
+    tuple[float, EmbeddedSubtitleMetadata],
+] = OrderedDict()
+EMBEDDED_METADATA_INFLIGHT: dict[
+    EmbeddedMetadataCacheKey,
+    Future[EmbeddedSubtitleMetadata],
+] = {}
+EMBEDDED_METADATA_LOCK = threading.Lock()
+EMBEDDED_METADATA_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="embedded-metadata")
+
+
+def clear_embedded_metadata_cache() -> None:
+    with EMBEDDED_METADATA_LOCK:
+        EMBEDDED_METADATA_CACHE.clear()
+
+
+def _probe_embedded_metadata(source: MediaSource, entry: FileEntry) -> EmbeddedSubtitleMetadata:
+    return probe_embedded_subtitles(
+        entry.path,
+        entry.size,
+        lambda start, end, timeout: source.read_range(entry.path, start, end, timeout=timeout),
+    )
+
+
+def _store_embedded_metadata(
+    key: EmbeddedMetadataCacheKey,
+    future: Future[EmbeddedSubtitleMetadata],
+) -> None:
+    try:
+        result = future.result()
+    except Exception:
+        result = EmbeddedSubtitleMetadata("unavailable")
+    ttl = (
+        EMBEDDED_METADATA_FAILURE_TTL_SECONDS
+        if result.status == "unavailable"
+        else EMBEDDED_METADATA_CACHE_TTL_SECONDS
+    )
+    with EMBEDDED_METADATA_LOCK:
+        if EMBEDDED_METADATA_INFLIGHT.get(key) is future:
+            EMBEDDED_METADATA_INFLIGHT.pop(key, None)
+        EMBEDDED_METADATA_CACHE[key] = (time.monotonic() + ttl, result)
+        EMBEDDED_METADATA_CACHE.move_to_end(key)
+        while len(EMBEDDED_METADATA_CACHE) > EMBEDDED_METADATA_CACHE_MAX_ENTRIES:
+            EMBEDDED_METADATA_CACHE.popitem(last=False)
+
+
+def request_embedded_metadata(
+    source: MediaSource,
+    entry: FileEntry,
+    *,
+    refresh: bool = False,
+) -> Future[EmbeddedSubtitleMetadata]:
+    key = (id(source), entry.path, entry.size or 0, entry.modified)
+    with EMBEDDED_METADATA_LOCK:
+        cached = EMBEDDED_METADATA_CACHE.get(key)
+        if refresh:
+            EMBEDDED_METADATA_CACHE.pop(key, None)
+        elif cached and cached[0] > time.monotonic():
+            EMBEDDED_METADATA_CACHE.move_to_end(key)
+            completed: Future[EmbeddedSubtitleMetadata] = Future()
+            completed.set_result(cached[1])
+            return completed
+        elif cached:
+            EMBEDDED_METADATA_CACHE.pop(key, None)
+        if pending := EMBEDDED_METADATA_INFLIGHT.get(key):
+            return pending
+        future = EMBEDDED_METADATA_EXECUTOR.submit(_probe_embedded_metadata, source, entry)
+        EMBEDDED_METADATA_INFLIGHT[key] = future
+    future.add_done_callback(lambda completed, cache_key=key: _store_embedded_metadata(cache_key, completed))
+    return future
+
+
 def reload_services(config: Config) -> None:
     """Build a complete service set, then expose it to new requests at once."""
     source, destination = build_storage(config)
@@ -2222,6 +2321,7 @@ def reload_services(config: Config) -> None:
         CONFIG, CONFIG_ERROR = config, None
         SOURCE, DESTINATION = source, destination
         WEBDAV, OPENSUBTITLES = webdav, opensubtitles
+    clear_embedded_metadata_cache()
 
 
 try:
@@ -2628,6 +2728,50 @@ def files(path: str = Query(default=""), refresh: bool = Query(default=False)) -
         return {"path": relative, "entries": entries, "location": location}
     except PipelineError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/files/embedded-subtitles")
+def embedded_subtitle_metadata(
+    path: str = Query(default=""),
+    refresh: bool = Query(default=False),
+) -> StreamingResponse:
+    _, source, _, _ = require_services()
+    try:
+        relative = normalize_relative(path)
+        entries = [entry for entry in source.list(relative) if entry.type == "video"]
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    pending = {
+        request_embedded_metadata(source, entry, refresh=refresh): entry
+        for entry in entries
+    }
+
+    def body() -> Iterable[bytes]:
+        for future in as_completed(pending):
+            entry = pending[future]
+            try:
+                result = future.result()
+            except Exception:
+                result = EmbeddedSubtitleMetadata("unavailable")
+            yield (
+                json.dumps(
+                    {
+                        "path": entry.path,
+                        "status": result.status,
+                        "languages": result.languages,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+
+    return StreamingResponse(
+        body(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @app.post("/api/folders/open")

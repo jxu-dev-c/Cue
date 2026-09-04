@@ -5,6 +5,7 @@
 Cue is a local web app for videos on WebDAV or your own filesystem. Choose a language, select your videos, and let Cue handle the subtitles.
 
 - **Find subtitles** from existing sidecars, complete indexed MKV text tracks, or OpenSubtitles.
+- **See subtitle languages** from sidecars and embedded MKV/WebM/MP4 tracks while browsing.
 - **Sync locally** using short audio samples.
 - **Translate English** through a configurable Chat Completions endpoint, with target-only, bilingual, or Minimalistic output.
 - **Process multiple videos** in sequence; one failed video won't stop the rest.

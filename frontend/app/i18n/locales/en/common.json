@@ -135,7 +135,10 @@
     "itemCount_one": "{{count}} item",
     "itemCount_other": "{{count}} items",
     "selectedCount_one": "{{count}} video selected",
-    "selectedCount_other": "{{count}} videos selected"
+    "selectedCount_other": "{{count}} videos selected",
+    "loadingEmbeddedSubtitles": "Loading embedded subtitle languages",
+    "embeddedSubtitleLabel": "{{language}} embedded subtitle",
+    "embeddedSubtitleTitle": "{{language}} · Embedded subtitle"
   },
   "setup": {
     "finishFirst": "Finish setup to open your media library",

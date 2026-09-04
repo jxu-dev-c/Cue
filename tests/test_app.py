@@ -162,6 +162,7 @@ class CoreTests(unittest.TestCase):
             defaults = get_settings()["values"]
             self.assertEqual(defaults["target_language"], "zh-cn")
             self.assertEqual(defaults["default_subtitle_mode"], "bilingual")
+            self.assertEqual(defaults["minimal_frequency_tier"], "2000")
             self.assertEqual(defaults["openai_rename_reasoning_effort"], "low")
             self.assertTrue(get_settings()["secrets"]["openai_api_key"])
             result = update_settings(SettingsRequest(values=values, secrets=secrets))
@@ -207,6 +208,9 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(raised.exception.status_code, 400)
             with self.assertRaises(HTTPException) as raised:
                 update_settings(SettingsRequest(values=values | {"default_subtitle_mode": "invalid"}))
+            self.assertEqual(raised.exception.status_code, 400)
+            with self.assertRaises(HTTPException) as raised:
+                update_settings(SettingsRequest(values=values | {"minimal_frequency_tier": "2500"}))
             self.assertEqual(raised.exception.status_code, 400)
             with self.assertRaises(HTTPException) as raised:
                 update_settings(SettingsRequest(values=values | {"openai_rename_reasoning_effort": "invalid"}))
@@ -986,6 +990,41 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(opensubtitles.languages, ("en",))
         self.assertEqual(result["outputPath"], "Movie.minimal.zh-Hans.ass")
         self.assertEqual(webdav.uploads[result["outputPath"]], b"[Script Info]\n")
+
+    def test_minimalistic_sidecar_is_not_reused_as_complete_target_subtitles(self):
+        source = FakeWebDAV()
+        name = "Movie.minimal.zh-Hans.ass"
+        source.sidecar_entries = [FileEntry(name, name, "file", 20)]
+        self.assertEqual(detect_sidecar_language_from_name("Movie.mkv", name), "zh-cn+en")
+        def translator(source, destination, _config, **_options):
+            shutil.copyfile(source, destination)
+            return {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
+        result = process_video("Movie.mkv", config(), source, FakeOpenSubtitles("en"), lambda *_: None,
+                               syncer=copy_sync, translator=translator, subtitle_mode="target")
+        self.assertNotIn("existing", result)
+        self.assertEqual(result["outputPath"], "Movie.zh-Hans.srt")
+
+    def test_minimalistic_requests_only_english_embedded_tracks_and_numbers_flat_ass_output(self):
+        from backend.embedded_subtitles import EmbeddedSubtitle
+
+        source = FakeWebDAV()
+        requested = []
+        def embedded(_path, languages):
+            requested.append(languages)
+            return EmbeddedSubtitle("en", "Full dialogue", SRT)
+        source.embedded_subtitle = embedded
+        destination = FakeWebDAV()
+        destination.exists = lambda path: path == "Movie.minimal.zh-Hans.ass"
+        def translator(_source, output, _config, **options):
+            self.assertEqual(options["subtitle_mode"], "minimalistic")
+            output.write_text("[Script Info]\n", encoding="utf-8")
+            return {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
+        result = process_video("Movie.mkv", config(), source, FakeOpenSubtitles("en"), lambda *_: None,
+                               translator=translator, subtitle_mode="minimalistic", destination=destination,
+                               flat_output=True)
+        self.assertEqual(requested, [("en",)])
+        self.assertEqual(result["outputPath"], "Movie.minimal (1).zh-Hans.ass")
+        self.assertEqual(destination.uploads[result["outputPath"]], b"[Script Info]\n")
 
     def test_existing_english_sidecar_is_translated_to_language_output(self):
         webdav = FakeWebDAV()

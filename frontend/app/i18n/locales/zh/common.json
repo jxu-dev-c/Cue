@@ -131,7 +131,10 @@
     "selectionHint": "始终保留现有字幕文件。",
     "clearSelection": "清除",
     "emptyHint": "请选择其他文件夹或在设置中检查扫描路径。",
-    "clearSearch": "清除搜索"
+    "clearSearch": "清除搜索",
+    "loadingEmbeddedSubtitles": "正在加载内嵌字幕语言",
+    "embeddedSubtitleLabel": "{{language}} 内嵌字幕",
+    "embeddedSubtitleTitle": "{{language}} · 内嵌字幕"
   },
   "setup": {
     "finishFirst": "完成设置后即可打开媒体库",
