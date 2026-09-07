@@ -45,6 +45,7 @@ Output names include the language: `Movie.es.srt` or `Movie.es.en.srt` for bilin
 
 - Smart Rename also renames matching subtitle files beside the video, preserving language and forced/SDH tags. It checks all destination names before moving files and attempts to restore earlier moves if a later move fails. NFO files, artwork, and subtitles in a separate output folder are not renamed.
 - Queued jobs keep the media source, output destination, and credentials selected when submitted, even if Settings changes before they run.
+- Translation sends up to 10 cues per AI request (6,000 source characters), with two preceding cues as context (1,000 characters total). Invalid replies are retried, then split into smaller batches down to individual cues. Four batches run concurrently. IDs and timestamps are preserved by the app; validation cannot guarantee that a translation has the correct meaning.
 - Local paths belong to the **machine running Cue**. Use absolute, existing, readable and writable directories. Local Smart Rename requires hard-link support.
 - WebDAV synchronization decodes **15 seconds of 8 kHz mono audio once**, then aligns subtitles using that audio in memory. Four bounded range reads overlap to reduce network latency, and signed download URLs are reused within a job. When readable SRT cues indicate a silent intro, the sample starts five seconds before the first cue (up to three minutes into the video). This fast mode corrects timing offsets; it does not attempt frame-rate drift correction from a short sample.
 - **No video or audio cache files are written to disk.** Remote reads use up to 16 MiB of RAM cache and at most **32 MiB or one quarter of the video size**, whichever is smaller, including rereads. Subtitle matching separately reads 128 KiB for the hash. Small subtitle files are still saved normally. The operating system manages RAM and may swap it.
@@ -107,5 +108,13 @@ npm --prefix frontend run lint
 npm --prefix frontend test
 npm --prefix frontend run build
 ```
+
+To check the reported split-sentence translation failure against your configured AI model, run:
+
+```sh
+RUN_TRANSLATION_LIVE=1 uv run python -m unittest tests.test_translation_live
+```
+
+This opt-in test translates the reported failure cases and fresh examples across three runs (12 batch requests before retries). It consumes API tokens and prints translations for review. Passing these targeted checks does not establish general translation quality.
 
 See [AGENTS.md](AGENTS.md) for a guide to the source files and tests.

@@ -32,7 +32,6 @@ from backend.app import (
     WebDAV,
     apply_subtitle_font_size,
     apply_unix_permissions,
-    batch_cues,
     calculate_moviehash,
     choose_output_path,
     detect_sidecar_language,
@@ -51,6 +50,7 @@ from backend.app import (
     run_job,
     sync_subtitle,
     subtitle_font_size,
+    batch_cues,
     translate_srt,
     update_job,
     update_settings,
@@ -325,16 +325,6 @@ class CoreTests(unittest.TestCase):
             subtitles = list(srt.parse(path.read_text(encoding="utf-8")))
 
         self.assertEqual(subtitles[0].content, '<font size="32">Hello there.</font>')
-
-    def test_cues_are_bounded_by_count_and_characters(self):
-        cues = [
-            (index, srt.Subtitle(index=index + 1, start=timedelta(), end=timedelta(seconds=1), content="x" * 130))
-            for index in range(205)
-        ]
-        batches = batch_cues(cues)
-        self.assertTrue(all(len(batch) <= 32 for batch in batches))
-        self.assertTrue(all(sum(len(cue.content) for _, cue in batch) <= 6_000 for batch in batches))
-        self.assertEqual(sum(map(len, batches)), len(cues))
 
     def test_candidate_preference_is_chinese_then_english(self):
         def item(language: str, file_id: int):
@@ -1313,7 +1303,7 @@ class FakeCompletions:
     def create(self, **kwargs):
         self.calls.append(kwargs)
         requested = json.loads(kwargs["messages"][1]["content"])
-        translations = [] if self.invalid else [{"id": row["id"], "text": "你好。"} for row in requested]
+        translations = [] if self.invalid else [{"id": row["id"], "text": "你好。"} for row in requested["cues"]]
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"translations": translations})))],
             usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
@@ -1397,6 +1387,142 @@ class TranslationTests(unittest.TestCase):
                 translate_srt(source, Path(directory) / "out.srt", config(), fake)
         self.assertEqual(len(calls), 1)
         sleep.assert_not_called()
+
+    def test_empty_translation_is_retried_even_when_all_ids_match(self):
+        fake = FakeAI()
+        create = fake.chat.completions.create
+
+        def empty_once(**kwargs):
+            completion = create(**kwargs)
+            if len(fake.chat.completions.calls) == 1:
+                result = json.loads(completion.choices[0].message.content)
+                result["translations"][-1]["text"] = " \n "
+                completion.choices[0].message.content = json.dumps(result)
+            return completion
+
+        with tempfile.TemporaryDirectory() as directory, patch("backend.app.time.sleep"):
+            source = Path(directory) / "in.srt"
+            output = Path(directory) / "out.srt"
+            source.write_bytes(SRT)
+            with patch.object(fake.chat.completions, "create", side_effect=empty_once):
+                usage = translate_srt(source, output, config(), fake)
+            self.assertTrue(all("你好。" in cue.content for cue in srt.parse(output.read_text())))
+        self.assertEqual(len(fake.chat.completions.calls), 2)
+        self.assertEqual(usage["totalTokens"], 36)
+        retry_prompt = fake.chat.completions.calls[1]["messages"][0]["content"]
+        self.assertIn("previous response failed validation", retry_prompt)
+        self.assertIn("must be a non-empty string", retry_prompt)
+        self.assertEqual(
+            fake.chat.completions.calls[0]["messages"][1],
+            fake.chat.completions.calls[1]["messages"][1],
+        )
+
+    def test_batches_preserve_ids_timestamps_and_use_short_context(self):
+        fake = FakeAI()
+        create = fake.chat.completions.create
+
+        def translate(**kwargs):
+            completion = create(**kwargs)
+            requested = json.loads(kwargs["messages"][1]["content"])
+            completion.choices[0].message.content = json.dumps({"translations": [
+                {"id": row["id"], "text": f"译文{row['id']}"}
+                for row in reversed(requested["cues"])
+            ]})
+            return completion
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, output = Path(directory) / "in.srt", Path(directory) / "out.srt"
+            original = [srt.Subtitle(index=10 + i, start=timedelta(seconds=i * 3),
+                                    end=timedelta(seconds=i * 3 + 2), content=f"Line {i}...")
+                        for i in range(23)]
+            source.write_text(srt.compose(original, reindex=False))
+            with patch.object(fake.chat.completions, "create", side_effect=translate):
+                usage = translate_srt(source, output, config(), fake, subtitle_mode="bilingual")
+            rendered = list(srt.parse(output.read_text()))
+        self.assertEqual(len(rendered), 23)
+        self.assertEqual(usage["totalTokens"], 3 * 18)
+        requests = sorted((json.loads(c["messages"][1]["content"]) for c in fake.chat.completions.calls),
+                          key=lambda request: request["cues"][0]["id"])
+        self.assertEqual([len(request["cues"]) for request in requests], [10, 10, 3])
+        for request in requests:
+            i = request["cues"][0]["id"]
+            self.assertEqual(request["context_before"], "\n".join(c.content for c in original[max(0, i-2):i]))
+        for i, (before, after) in enumerate(zip(original, rendered)):
+            self.assertEqual((before.index, before.start, before.end), (after.index, after.start, after.end))
+            self.assertEqual(after.content, before.content + f"\n译文{i}")
+
+    def test_invalid_batches_split_to_singletons_and_count_failed_usage(self):
+        fake = FakeAI()
+        create = fake.chat.completions.create
+
+        def reject_batches(**kwargs):
+            completion = create(**kwargs)
+            requested = json.loads(kwargs["messages"][1]["content"])
+            if len(requested["cues"]) > 1:
+                completion.choices[0].message.content = '{"translations": []}'
+            return completion
+
+        with tempfile.TemporaryDirectory() as directory, patch("backend.app.time.sleep"):
+            source, output = Path(directory) / "in.srt", Path(directory) / "out.srt"
+            source.write_text(srt.compose([
+                srt.Subtitle(index=i+1, start=timedelta(seconds=i), end=timedelta(seconds=i+1), content="Hello.")
+                for i in range(4)
+            ]))
+            with patch.object(fake.chat.completions, "create", side_effect=reject_batches):
+                usage = translate_srt(source, output, config(), fake)
+            self.assertEqual(len(list(srt.parse(output.read_text()))), 4)
+        sizes = [len(json.loads(call["messages"][1]["content"])["cues"]) for call in fake.chat.completions.calls]
+        self.assertEqual(sizes, [4, 4, 4, 2, 2, 2, 1, 1, 2, 2, 2, 1, 1])
+        self.assertEqual(usage["totalTokens"], len(sizes) * 18)
+
+    def test_batches_are_bounded_by_characters(self):
+        cues = [(i, srt.Subtitle(index=i, start=timedelta(), end=timedelta(seconds=1), content="x"*1500))
+                for i in range(11)]
+        self.assertEqual([len(batch) for batch in batch_cues(cues)], [4, 4, 3])
+
+    def test_persistent_empty_translation_does_not_write_output(self):
+        fake = FakeAI()
+        create = fake.chat.completions.create
+
+        def empty(**kwargs):
+            completion = create(**kwargs)
+            result = json.loads(completion.choices[0].message.content)
+            result["translations"][-1]["text"] = ""
+            completion.choices[0].message.content = json.dumps(result)
+            return completion
+
+        with tempfile.TemporaryDirectory() as directory, patch("backend.app.time.sleep"):
+            source = Path(directory) / "in.srt"
+            output = Path(directory) / "out.srt"
+            source.write_bytes(SRT)
+            with patch.object(fake.chat.completions, "create", side_effect=empty):
+                with self.assertRaisesRegex(PipelineError, "three attempts"):
+                    translate_srt(source, output, config(), fake)
+            self.assertFalse(output.exists())
+        self.assertEqual(len(fake.chat.completions.calls), 3)
+
+    def test_single_cue_response_rejects_extra_duplicate_and_noninteger_ids(self):
+        for invalid_ids in ([0, 1], [0, 0], [False], [0.0]):
+            with self.subTest(ids=invalid_ids):
+                fake = FakeAI()
+                create = fake.chat.completions.create
+
+                def invalid_response(**kwargs):
+                    completion = create(**kwargs)
+                    completion.choices[0].message.content = json.dumps({"translations": [
+                        {"id": cue_id, "text": "你好。"} for cue_id in invalid_ids
+                    ]})
+                    return completion
+
+                with tempfile.TemporaryDirectory() as directory, patch("backend.app.time.sleep"):
+                    source = Path(directory) / "in.srt"
+                    output = Path(directory) / "out.srt"
+                    source.write_bytes(SRT)
+                    with patch.object(fake.chat.completions, "create", side_effect=invalid_response):
+                        with self.assertRaisesRegex(PipelineError, "three attempts"):
+                            translate_srt(source, output, config(), fake)
+                    self.assertFalse(output.exists())
+                self.assertEqual(len(fake.chat.completions.calls), 3)
 
 
 class OpenFolderTests(unittest.TestCase):
