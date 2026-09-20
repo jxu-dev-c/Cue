@@ -4,7 +4,7 @@ import shutil
 import struct
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -531,6 +531,63 @@ class CoreTests(unittest.TestCase):
             )
         )
 
+    def test_opensubtitles_matches_alternate_series_title_from_subtitle_filename(self):
+        # Real search responses use the canonical parent title Tengoku Daimakyo
+        # even when the query and subtitle filename use Heavenly Delusion.
+        filenames = [
+            "[A-L] Heavenly Delusion - 01 [Jpn]_Track05",
+            "Heavenly Delusion s1e2",
+            "heavenly Delusion s1e3",
+            "[EMBER] Heavenly Delusion - 04.srt - eng(2)",
+            "Heavenly Delusion S01E05",
+            "Heavenly Delusion s01e06",
+            "heavenly Delusion S01E07",
+        ]
+        for episode, filename in enumerate(filenames, 1):
+            with self.subTest(episode=episode):
+                item = {"attributes": {
+                    "language": "en", "nb_cd": 1, "release": "Tengoku Daimakyou",
+                    "feature_details": {
+                        "parent_title": "Tengoku Daimakyo",
+                        "season_number": 1, "episode_number": episode,
+                    },
+                    "files": [{"file_id": 8000000 + episode, "file_name": filename}],
+                }}
+                responses = iter([[], [item]])
+                client = httpx.Client(
+                    base_url="https://api.opensubtitles.com/api/v1/",
+                    transport=httpx.MockTransport(
+                        lambda _: httpx.Response(200, json={"data": next(responses)})
+                    ),
+                )
+                selected = OpenSubtitles(config(), client).find(
+                    f"Heavenly.Delusion.S01E{episode:02}.1080p.BluRay.Remux.AVC.FLAC.2.0-Flugel.mkv",
+                    "9e433af2ca9cd6a5", ("zh-cn", "en"),
+                )
+                self.assertEqual(selected.file_id, 8000000 + episode)
+                self.assertFalse(selected.moviehash_match)
+
+    def test_opensubtitles_alternate_title_keeps_episode_and_identity_checks(self):
+        guessed = {"title": "Heavenly Delusion", "type": "episode", "season": 1, "episode": 1}
+        cases = [
+            ("Unrelated Show S01E01", 1, 1),
+            ("Heavenly Delusion Extras S01E01", 1, 1),
+            ("Heavenly Delusion S01E01", 1, 2),
+            ("Heavenly Delusion S01E01", 2, 1),
+            ("Heavenly Delusion", None, None),
+            ("Heavenly Delusion S01E02", 1, 1),
+            ("Heavenly Delusion S02E01", 1, 1),
+        ]
+        for filename, season, episode in cases:
+            with self.subTest(filename=filename, season=season, episode=episode):
+                self.assertFalse(OpenSubtitles._metadata_match({"attributes": {
+                    "feature_details": {
+                        "parent_title": "Tengoku Daimakyo",
+                        "season_number": season, "episode_number": episode,
+                    },
+                    "files": [{"file_id": 1, "file_name": filename}],
+                }}, guessed))
+
     def test_opensubtitles_episode_search_omits_series_year(self):
         requests = []
 
@@ -551,24 +608,16 @@ class CoreTests(unittest.TestCase):
 
         self.assertNotIn("year", requests[1].url.params)
 
-    def test_sync_uses_16khz_speech_analysis(self):
+    def test_local_sync_uses_short_sample_approximation(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.srt"
             output = Path(directory) / "output.srt"
             source.write_bytes(SRT)
 
-            def run(args, **_):
-                output.write_bytes(SRT)
-                return SimpleNamespace(returncode=0)
-
-            with patch("backend.app.shutil.which", return_value="ffsubsync"), patch(
-                "backend.app.subprocess.run", side_effect=run
-            ) as process:
-                sync_subtitle("/media/Movie.mkv", source, output, config())
-
-        arguments = process.call_args.args[0]
-        self.assertEqual(arguments[1], "/media/Movie.mkv")
-        self.assertEqual(arguments[arguments.index("--frame-rate") + 1], "16000")
+            with patch("backend.app.sync_remote", return_value={"approximate":True}) as align:
+                result=sync_subtitle("/media/Movie.mkv", source, output, config())
+                align.assert_called_once_with("/media/Movie.mkv",source,output)
+                self.assertTrue(result["approximate"])
 
     def test_sidecar_language_uses_content_and_language_suffix(self):
         video = "Movie.2026.mkv"
@@ -842,6 +891,23 @@ def copy_sync(_, source, destination, __):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_embedded_subtitle_bypasses_external_search_and_timing_guess(self):
+        from backend.embedded_subtitles import EmbeddedSubtitle
+
+        source=FakeWebDAV()
+        source.embedded_subtitle=lambda *_: EmbeddedSubtitle("zh-cn","Full dialogue",SRT)
+        def forbidden(*_):
+            raise AssertionError("Embedded timing must not be guessed or downloaded")
+        service=FakeOpenSubtitles("en")
+        service.find=forbidden
+        result=process_video("Movie.mkv",config(),source,service,lambda *_:None,
+                             syncer=forbidden,translator=forbidden,subtitle_mode="target")
+        actual=list(srt.parse(source.uploads[result["outputPath"]].decode()))
+        expected=list(srt.parse(SRT.decode()))
+        self.assertEqual([c.start for c in actual],[c.start for c in expected])
+        self.assertEqual(source.hash_calls,0)
+        self.assertFalse(result["moviehashMatch"])
+
     def test_existing_chinese_sidecar_completes_without_network_or_upload(self):
         webdav = FakeWebDAV()
         entry = FileEntry("Movie.zh-Hans.srt", "Movie.zh-Hans.srt", "file", 20)
@@ -1010,6 +1076,36 @@ class PipelineTests(unittest.TestCase):
         self.assertIn(b"Translated", webdav.uploads["Movie.zh-Hans.en.srt"])
         self.assertEqual(result["aiUsage"]["totalTokens"], 15)
         self.assertEqual(opensubtitles.languages, ("en",))
+
+    def test_ambiguous_remote_timing_stops_before_translation_and_upload(self):
+        from backend.media_range import MediaReadError
+
+        webdav = FakeWebDAV()
+        service = FakeOpenSubtitles("en")
+        service.find = lambda *_: SubtitleCandidate(1, "en", "Metadata match", False)
+        with patch.object(webdav, "sync_input", return_value=nullcontext("http://127.0.0.1:1234/video")), \
+             patch("backend.app.sync_remote", side_effect=MediaReadError("Subtitle timing is ambiguous")), \
+             patch("backend.app.translate_srt") as translator:
+            with self.assertRaisesRegex(PipelineError, "timing is ambiguous"):
+                process_video("Movie.mkv", config(), webdav, service,
+                              lambda *_: None, translator=translator)
+        translator.assert_not_called()
+        self.assertEqual(webdav.uploads, {})
+
+    def test_approximate_timing_is_returned_and_can_be_translated(self):
+        source=FakeWebDAV()
+        service=FakeOpenSubtitles("en")
+        service.find=lambda *_: SubtitleCandidate(1,"en","Metadata match",False)
+        def approximate(video,original,output,cfg):
+            copy_sync(video,original,output,cfg)
+            return {"method":"short-sample","approximate":True,"offsetSeconds":0}
+        def translate(original,output,cfg,**kwargs):
+            output.write_bytes(original.read_bytes())
+            return {"totalTokens":1}
+        result=process_video("Movie.mkv",config(),source,service,lambda *_:None,
+                             syncer=approximate,translator=translate)
+        self.assertTrue(result["timing"]["approximate"])
+        self.assertTrue(source.uploads)
 
     def test_webdav_target_sidecar_is_copied_to_numbered_local_output(self):
         webdav = FakeWebDAV()

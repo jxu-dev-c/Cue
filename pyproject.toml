@@ -5,11 +5,14 @@ description = "Local and WebDAV subtitle finder, synchronizer, and translator"
 requires-python = ">=3.10,<3.15"
 dependencies = [
   "chardet>=7,<8",
+  "enzyme==0.5.2",
   "fastapi>=0.116,<1",
-  "ffsubsync==0.5.1",
+  "numpy>=1.24,<3",
+  "webrtcvad-wheels>=2.0.14,<3",
   "guessit>=3.8,<4",
   "httpx>=0.28,<1",
   "openai>=2,<3",
+  "pysubs2>=1.8,<2",
   "python-dotenv>=1,<2",
   "srt>=3.5,<4",
   "uvicorn[standard]>=0.35,<1",

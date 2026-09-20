@@ -76,6 +76,8 @@ class MediaRangeTests(unittest.TestCase):
 
         for status, headers, message in (
             (200, {}, "full download refused"),
+            (429, {}, "HTTP 429"),
+            (503, {}, "HTTP 503"),
             (206, {"Content-Range": "bytes 1-1024/4096"}, "invalid media byte range"),
             (206, {"Content-Range": "bytes 0-1023/4096", "Content-Encoding": "gzip"}, "encoded media"),
             (206, {"Content-Range": "bytes 0-1023/4096", "Content-Length": "1025"}, "range length"),
@@ -143,7 +145,7 @@ class MediaRangeTests(unittest.TestCase):
     def test_signed_media_url_is_reused_without_forwarding_credentials(self):
         initial_requests = []
         media_requests = []
-        size = 4 * 1024 * 1024
+        size = 16 * 1024 * 1024
 
         def initial(request):
             initial_requests.append(request)
@@ -162,7 +164,7 @@ class MediaRangeTests(unittest.TestCase):
             source = WebDAV(config(), initial_client, media_client)
             with patch.object(source, "file_info", return_value=FileEntry("v.mkv", "v.mkv", "video", size)):
                 with source.sync_input("v.mkv") as url:
-                    for offset in (0, 262144, 0):
+                    for offset in (0, 1048576, 0):
                         response = local_client.get(url, headers={"Range": f"bytes={offset}-{offset}"})
                         self.assertEqual(response.content, b"x")
             self.assertEqual(len(initial_requests), 1)

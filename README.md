@@ -4,8 +4,8 @@
 
 Cue is a local web app for videos on WebDAV or your own filesystem. Choose a language, select your videos, and let Cue handle the subtitles.
 
-- **Find subtitles** from existing sidecar files or OpenSubtitles.
-- **Sync locally** using a short audio sample (15 seconds for WebDAV).
+- **Find subtitles** from existing sidecars, complete indexed MKV text tracks, or OpenSubtitles.
+- **Sync locally** using short audio samples.
 - **Translate English** through a configurable Chat Completions endpoint, with target-only or bilingual output.
 - **Process multiple videos** in sequence; one failed video won't stop the rest.
 - **Keep your library organized** with language-tagged filenames and Smart Rename. Existing subtitle files are never overwritten.
@@ -34,7 +34,7 @@ Choose your subtitle language and output mode during setup. You can change every
 
 ## Using Cue
 
-Browse to a folder, select one or more videos, and start a job. Cue prefers existing subtitles before searching OpenSubtitles.
+Browse to a folder, select one or more videos, and start a job. Cue prefers existing target subtitles, then complete indexed MKV text tracks, before searching OpenSubtitles. Embedded text keeps the video's own timestamps and needs no guessed synchronization.
 
 | Video source | Subtitle destination |
 | --- | --- |
@@ -47,9 +47,10 @@ Output names include the language: `Movie.es.srt` or `Movie.es.en.srt` for bilin
 - Queued jobs keep the media source, output destination, and credentials selected when submitted, even if Settings changes before they run.
 - Translation sends up to 10 cues per AI request (6,000 source characters), with two preceding cues as context (1,000 characters total). Invalid replies are retried, then split into smaller batches down to individual cues. Four batches run concurrently. IDs and timestamps are preserved by the app; validation cannot guarantee that a translation has the correct meaning.
 - Local paths belong to the **machine running Cue**. Use absolute, existing, readable and writable directories. Local Smart Rename requires hard-link support.
-- WebDAV synchronization decodes **15 seconds of 8 kHz mono audio once**, then aligns subtitles using that audio in memory. Four bounded range reads overlap to reduce network latency, and signed download URLs are reused within a job. When readable SRT cues indicate a silent intro, the sample starts five seconds before the first cue (up to three minutes into the video). This fast mode corrects timing offsets; it does not attempt frame-rate drift correction from a short sample.
-- **No video or audio cache files are written to disk.** Remote reads use up to 16 MiB of RAM cache and at most **32 MiB or one quarter of the video size**, whichever is smaller, including rereads. Subtitle matching separately reads 128 KiB for the hash. Small subtitle files are still saved normally. The operating system manages RAM and may swap it.
-- Remote audio extraction stops after 45 seconds of wall time; subsequent alignment has a 20-second limit. Servers must support byte ranges. Unsupported servers or videos that exceed the limits fail without falling back to a full download. Interleaved video/audio still requires some video bytes; WebDAV does not provide server-side quality conversion. Local videos retain the five-minute synchronization behavior.
+- Indexed MKV extraction uses Enzyme to read the track and seek index, then fetches only the selected text subtitle blocks. It checks the index against the track's frame/byte statistics and packet timestamps before accepting it as complete. Disabled, forced, commentary, and signs-only tracks are excluded. Supported text codecs are SRT/UTF-8, ASS and SSA; missing or incomplete indexes fall back to the normal pipeline.
+- Without complete embedded or exact-match subtitles, Cue uses its own **best-effort short-sample alignment** (up to three 8-second dialogue samples). It selects a default non-commentary audio track and estimates a constant offset from the observed intervals. Ambiguous estimates are allowed and jobs are labelled “approximate timing.” If there is no positive match or the shift would lose opening cues, original timestamps are retained. Text, IDs and cue counts are preserved. Frame-rate drift is not corrected. FFmpeg/ffprobe decode and inspect media; ffsubsync is not used or required.
+- **No video or audio cache files are written to disk.** Indexed subtitle reads use 16 KiB blocks, at most 16 MiB of cache and a separate **64 MiB or one quarter of the video size** transfer limit. Audio synchronization uses up to 16 MiB of cache and **256 MiB or one quarter of the video size**, whichever is smaller, including rereads. Audio reads use 1 MiB ranges. Subtitle hashing separately reads 128 KiB. Small subtitle files are saved normally; the operating system may swap RAM.
+- Indexed subtitle extraction has a five-minute deadline for its many small requests; audio range reads have a 120-second deadline. Servers must support byte ranges; failures never trigger a full video download. Incomplete audio or media-read failures still stop the job. Local and remote videos use the same short-sample approximation when needed.
 - Settings and credentials are stored in `~/.config/subtitle-maker/config.json`. Saved credentials are not returned to the browser.
 - Cue runs on **localhost / 127.0.0.1**. Keep the server running while using it.
 

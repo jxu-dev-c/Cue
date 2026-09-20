@@ -15,10 +15,12 @@ from typing import Callable, Iterator
 
 import httpx
 
-BLOCK_BYTES = 256 * 1024
-MAX_SYNC_BYTES = 32 * 1024 * 1024
+BLOCK_BYTES = 1024 * 1024
+# A short sample from a high-bitrate remux still includes interleaved video
+# and container headers. Keep the network budget separate from the RAM cache.
+MAX_SYNC_BYTES = 256 * 1024 * 1024
 MAX_CACHE_BYTES = 16 * 1024 * 1024
-REMOTE_SECONDS = 75
+REMOTE_SECONDS = 120
 LOGGER = logging.getLogger("uvicorn.error")
 
 
@@ -27,8 +29,9 @@ class MediaReadError(RuntimeError):
 
 
 class RangeCache:
-    def __init__(self, size: int, open_range: Callable[[dict[str, str]], httpx.Response], *, max_bytes: int | None = None, prefetch: bool = False):
+    def __init__(self, size: int, open_range: Callable[[dict[str, str]], httpx.Response], *, max_bytes: int | None = None, prefetch: bool = False, block_bytes: int | None = None):
         self.size = size
+        self.block_bytes = BLOCK_BYTES if block_bytes is None else block_bytes
         self.blocks: OrderedDict[int, bytes] = OrderedDict()
         self.cached_bytes = 0
         self.max_bytes = MAX_SYNC_BYTES if max_bytes is None else max_bytes
@@ -58,10 +61,10 @@ class RangeCache:
                 return self.blocks[index]
             # Reserve the entire requested range before scheduling any I/O.
             # Optional read-ahead never triggers retries or exceeds the budget.
-            for candidate in range(index, min(index + 4, (self.size + BLOCK_BYTES - 1) // BLOCK_BYTES)):
+            for candidate in range(index, min(index + 4, (self.size + self.block_bytes - 1) // self.block_bytes)):
                 if candidate in self.blocks or candidate in self.pending:
                     continue
-                expected = min(BLOCK_BYTES, self.size - candidate * BLOCK_BYTES)
+                expected = min(self.block_bytes, self.size - candidate * self.block_bytes)
                 if self.reserved + expected > self.max_bytes or len(self.pending) >= 4:
                     break
                 self.reserved += expected
@@ -104,7 +107,7 @@ class RangeCache:
         if index in self.blocks:
             return
         # Reserve space for up to four completed/in-flight prefetch blocks.
-        cache_limit = max(BLOCK_BYTES, MAX_CACHE_BYTES - (4 * BLOCK_BYTES if self.executor else 0))
+        cache_limit = max(self.block_bytes, MAX_CACHE_BYTES - (4 * self.block_bytes if self.executor else 0))
         while self.blocks and self.cached_bytes + len(data) > cache_limit:
             _, discarded = self.blocks.popitem(last=False)
             self.cached_bytes -= len(discarded)
@@ -114,7 +117,7 @@ class RangeCache:
     def _fetch(self, index: int) -> bytes:
         # Reuse the bounded response validation, but keep network I/O outside
         # the parent cache lock so four independent ranges can overlap.
-        reader = RangeCache(self.size, self.open_range, max_bytes=BLOCK_BYTES)
+        reader = RangeCache(self.size, self.open_range, max_bytes=self.block_bytes, block_bytes=self.block_bytes)
         reader.deadline = self.deadline
         try:
             return reader._block(index)
@@ -135,8 +138,8 @@ class RangeCache:
                 if index in self.blocks:
                     self.blocks.move_to_end(index)
                     return self.blocks[index]
-                start = index * BLOCK_BYTES
-                end = min(start + BLOCK_BYTES, self.size) - 1
+                start = index * self.block_bytes
+                end = min(start + self.block_bytes, self.size) - 1
                 expected = end - start + 1
                 if self.fetched + expected > self.max_bytes:
                     raise MediaReadError(
@@ -149,7 +152,9 @@ class RangeCache:
                 })
                 try:
                     if response.status_code != 206:
-                        raise MediaReadError("WebDAV server does not support required byte ranges; full download refused")
+                        if response.status_code == 200:
+                            raise MediaReadError("WebDAV server does not support required byte ranges; full download refused")
+                        raise MediaReadError(f"Remote media range request failed (HTTP {response.status_code})")
                     if response.headers.get("content-range") != f"bytes {start}-{end}/{self.size}":
                         raise MediaReadError("WebDAV returned an invalid media byte range")
                     if response.headers.get("content-encoding", "identity").lower() != "identity":
@@ -195,7 +200,7 @@ def remote_media(size: int, suffix: str, open_range: Callable[[dict[str, str]], 
 
 @contextmanager
 def memory_media(data: bytes, suffix: str = ".wav") -> Iterator[str]:
-    """Expose already-decoded audio to ffsubsync without writing media to disk."""
+    """Expose in-memory media to a decoder without writing media to disk."""
     def read(headers: dict[str, str]) -> httpx.Response:
         start, end = map(int, headers["Range"][6:].split("-"))
         return httpx.Response(206, headers={"Content-Range": f"bytes {start}-{end}/{len(data)}"},
@@ -255,7 +260,7 @@ def serve_media(cache: RangeCache, suffix: str) -> Iterator[str]:
                     return
             try:
                 # Validate/fetch the first block before sending a success status.
-                data = cache.block(start // BLOCK_BYTES) if body else b""
+                data = cache.block(start // cache.block_bytes) if body else b""
             except MediaReadError:
                 self.send_error(502)
                 return
@@ -270,15 +275,15 @@ def serve_media(cache: RangeCache, suffix: str) -> Iterator[str]:
                 return
             try:
                 while start <= end and not cache.stopped.is_set():
-                    length = min(len(data) - start % BLOCK_BYTES, end - start + 1)
-                    self.wfile.write(data[start % BLOCK_BYTES : start % BLOCK_BYTES + length])
+                    length = min(len(data) - start % cache.block_bytes, end - start + 1)
+                    self.wfile.write(data[start % cache.block_bytes : start % cache.block_bytes + length])
                     start += length
                     if start <= end:
-                        data = cache.block(start // BLOCK_BYTES)
+                        data = cache.block(start // cache.block_bytes)
             except (OSError, MediaReadError):
                 # FFmpeg closes requests when seeking or finishing its sample.
                 # Cache errors are retained and raised to the job, even if
-                # ffsubsync treats a truncated response as usable audio.
+                # a decoder treats a truncated response as usable audio.
                 self.close_connection = True
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

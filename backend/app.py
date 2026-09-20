@@ -39,8 +39,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from backend.frontend import FrontendFiles
 from backend.config_storage import config_path
-from backend.media_range import MediaReadError, remote_media, memory_media
-from backend.audio_sample import extract_audio, sample_start
+from backend.media_range import MediaReadError, remote_media
+from backend.subtitle_sync import sync_remote
+from backend.embedded_subtitles import EmbeddedSubtitle, SparseReader, extract_indexed
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 CONFIG_PATH = config_path(Path.home())
@@ -842,12 +843,7 @@ class WebDAV:
             first, last = first_read.result(), last_read.result()
         return calculate_moviehash(size, first, last)
 
-    @contextmanager
-    def sync_input(self, relative: str) -> Iterator[str]:
-        relative = normalize_relative(relative)
-        size = self.file_info(relative).size
-        if not size or size < 0:
-            raise PipelineError("WebDAV returned an invalid video length")
+    def _range_opener(self, relative: str) -> Callable[[dict[str, str]], httpx.Response]:
         resolved_url: str | None = None
         resolved_client = self.client
         resolution_lock = threading.Lock()
@@ -874,8 +870,16 @@ class WebDAV:
                 resolved_client = self.media_client if resolved_url != self.url_for(relative) else self.client
             return response
 
+        return open_range
+
+    @contextmanager
+    def sync_input(self, relative: str) -> Iterator[str]:
+        relative = normalize_relative(relative)
+        size = self.file_info(relative).size
+        if not size or size < 0:
+            raise PipelineError("WebDAV returned an invalid video length")
         try:
-            with remote_media(size, PurePosixPath(relative).suffix, open_range) as url:
+            with remote_media(size, PurePosixPath(relative).suffix, self._range_opener(relative)) as url:
                 yield url
         except MediaReadError as exc:
             raise PipelineError(str(exc)) from exc
@@ -888,6 +892,22 @@ class WebDAV:
             return read_bounded_response(response, limit, "Existing subtitle is unexpectedly large")
         finally:
             response.close()
+
+    def embedded_subtitle(self, relative: str, languages: tuple[str, ...]) -> EmbeddedSubtitle | None:
+        if PurePosixPath(relative).suffix.lower() != ".mkv":
+            return None
+        relative = normalize_relative(relative)
+        size = self.file_info(relative).size
+        if not size:
+            return None
+        reader = SparseReader(size, self._range_opener(relative))
+        started = time.monotonic()
+        try:
+            return extract_indexed(reader, languages)
+        except MediaReadError as exc:
+            raise PipelineError(str(exc)) from exc
+        finally:
+            LOGGER.info("embedded_subtitle bytes=%d elapsed=%.2fs", reader.cache.fetched, time.monotonic()-started)
 
     def put(self, relative: str, data: bytes) -> None:
         response = self._request(
@@ -977,6 +997,12 @@ class LocalStorage:
         except OSError as exc:
             raise PipelineError("Could not inspect local sidecar subtitles") from exc
         return matching_sidecar_entries(video.name, entries)
+
+    def embedded_subtitle(self, relative: str, languages: tuple[str, ...]) -> EmbeddedSubtitle | None:
+        if PurePosixPath(relative).suffix.lower() != ".mkv":
+            return None
+        with self._path(relative, must_exist=True).open("rb") as stream:
+            return extract_indexed(stream, languages)
 
     def file_info(self, relative: str) -> FileEntry:
         path = self._path(relative, must_exist=True)
@@ -1203,7 +1229,8 @@ class OpenSubtitles:
         attrs = item.get("attributes", {})
         language = str(attrs.get("language", "")).lower()
         files = attrs.get("files") or []
-        if (language != "en" and language not in TARGET_LANGUAGES) or attrs.get("nb_cd", 1) != 1 or not files:
+        if ((language != "en" and language not in TARGET_LANGUAGES) or attrs.get("nb_cd", 1) != 1
+                or not files or attrs.get("foreign_parts_only")):
             return None
         try:
             file_id = int(files[0]["file_id"])
@@ -1217,22 +1244,71 @@ class OpenSubtitles:
         )
 
     @staticmethod
-    def _metadata_match(item: dict[str, Any], guessed: dict[str, Any]) -> bool:
-        details = item.get("attributes", {}).get("feature_details") or {}
+    def _metadata_match(
+        item: dict[str, Any], guessed: dict[str, Any], aliases: Iterable[str] = (),
+    ) -> bool:
+        attrs = item.get("attributes", {})
+        details = attrs.get("feature_details") or {}
         if not isinstance(details, dict):
             return False
         expected_title = normalized_title(str(guessed.get("title", "")))
         if not expected_title:
             return False
-        if guessed.get("type") == "episode":
-            if details.get("season_number") != guessed.get("season") or details.get("episode_number") != guessed.get("episode"):
+        kind = guessed.get("type", "movie")
+        feature_type = str(details.get("feature_type") or "").casefold()
+        if feature_type and feature_type != kind:
+            return False
+
+        # Only inspect the file _candidate will download, not another disc/file.
+        files = attrs.get("files") or []
+        names = [attrs.get("release"), files[0].get("file_name") if files else None]
+        releases = [guessit(normalize_release_filename(str(name)), {"type": kind}) for name in names if name]
+        for release in releases:
+            other = release.get("other", [])
+            if isinstance(other, str):
+                other = [other]
+            if "Extras" in other or (kind == "movie" and release.get("episode") is not None):
                 return False
-            actual_title = normalized_title(str(details.get("parent_title", "")))
-        else:
-            if guessed.get("year") and details.get("year") != guessed.get("year"):
+
+        def number(value: Any) -> int | None:
+            # API metadata sometimes uses strings; lists (multi-episode
+            # releases), booleans, and malformed numbers are not single IDs.
+            return int(str(value)) if re.fullmatch(r"\d+", str(value)) else None
+
+        keys = (("season", "season_number"), ("episode", "episode_number")) if kind == "episode" else (("year", "year"),)
+        for key, api_key in keys:
+            expected = number(guessed.get(key))
+            if expected is None:
+                if kind == "episode" or guessed.get(key) is not None:
+                    return False
+                continue
+            observed = [details.get(api_key), *(release.get(key) for release in releases)]
+            present = [value for value in observed if value is not None]
+            if not present or any(number(value) != expected for value in present):
                 return False
-            actual_title = normalized_title(str(details.get("title") or details.get("movie_name") or ""))
-        return bool(actual_title) and (expected_title == actual_title or expected_title in actual_title or actual_title in expected_title)
+
+        # Alternate titles can be present in the catalogue, release name, or
+        # subtitle filename. Require an exact normalized title, not a substring
+        # ("It" must not match "Little Women"), plus the identity checks above.
+        canonical = details.get("parent_title") if kind == "episode" else details.get("title") or details.get("movie_name")
+        titles = [canonical, *aliases, *(release.get("title") for release in releases)]
+        return any(normalized_title(str(title)) == expected_title for title in titles if title)
+
+    def _feature_titles(self, feature_id: int) -> tuple[str, ...]:
+        response = self._request(
+            "GET", "features", "OpenSubtitles title lookup", params={"feature_id": feature_id},
+        )
+        if response.status_code != 200:
+            raise self._api_failure("OpenSubtitles title lookup", response)
+        for item in response.json().get("data", []):
+            attrs = item.get("attributes", {})
+            if str(attrs.get("feature_id") or item.get("id")) != str(feature_id):
+                continue
+            aliases = attrs.get("title_aka") or []
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            return tuple(title for title in [attrs.get("title"), attrs.get("original_title"), *aliases] if isinstance(title, str))
+        return ()
 
     @staticmethod
     def _prefer(items: Iterable[dict[str, Any]], languages: tuple[str, ...]) -> SubtitleCandidate | None:
@@ -1266,9 +1342,42 @@ class OpenSubtitles:
         if guessed.get("type") == "episode":
             params.update(season_number=guessed.get("season"), episode_number=guessed.get("episode"))
         fallback = self._search({key: value for key, value in params.items() if value is not None})
-        candidate = self._prefer((item for item in fallback if self._metadata_match(item, guessed)), languages)
+        matched = [item for item in fallback if self._metadata_match(item, guessed)]
+        candidate = self._prefer(matched, languages)
+        alias_languages = languages[:languages.index(candidate.language)] if candidate else languages
+        if alias_languages:
+            # Resolve catalogue aliases by the result's stable feature ID,
+            # never by assuming every fuzzy text-search hit is the same title.
+            feature_titles: dict[int, tuple[str, ...]] = {}
+            for item in fallback:
+                if not self._prefer([item], alias_languages):
+                    continue
+                # A title alias cannot repair conflicting or ambiguous numbers.
+                if not self._metadata_match(item, guessed, (str(guessed.get("title", "")),)):
+                    continue
+                details = item.get("attributes", {}).get("feature_details") or {}
+                key = "parent_feature_id" if guessed.get("type") == "episode" else "feature_id"
+                feature_id = details.get(key) if isinstance(details, dict) else None
+                if not re.fullmatch(r"[1-9]\d*", str(feature_id)):
+                    continue
+                feature_id = int(feature_id)
+                if feature_id not in feature_titles:
+                    feature_titles[feature_id] = self._feature_titles(feature_id)
+                if self._metadata_match(item, guessed, feature_titles[feature_id]):
+                    matched.append(item)
+            candidate = self._prefer(matched, languages)
         if not candidate:
-            raise PipelineError("No reliable requested subtitle was found")
+            LOGGER.warning(
+                "subtitle_search_rejected filename=%r title=%r season=%s episode=%s "
+                "languages=%s results=%d metadata_matches=%d",
+                filename, guessed.get("title"), guessed.get("season"), guessed.get("episode"),
+                language_query, len(fallback), len(matched),
+            )
+            raise PipelineError(
+                "No reliable requested subtitle was found "
+                f"(OpenSubtitles returned {len(fallback)} title-search results; "
+                f"{len(matched)} matched the video metadata; requested languages: {language_query})"
+            )
         return candidate
 
     def download(self, candidate: SubtitleCandidate) -> tuple[bytes, dict[str, Any]]:
@@ -1671,44 +1780,9 @@ def translate_srt(
     return usage
 
 
-def sync_subtitle(video_input: str, input_path: Path, output_path: Path, _: Config) -> None:
-    executable = shutil.which("ffsubsync")
-    if not executable:
-        raise PipelineError("ffsubsync is not installed; run `uv sync`")
-    remote = video_input.startswith("http://127.0.0.1:")
+def sync_subtitle(video_input: str, input_path: Path, output_path: Path, _: Config) -> dict[str, Any]:
     try:
-        # Only the decoder touches the remote video. ffsubsync's repeated
-        # probing and audio analysis use the small in-memory WAV reference.
-        reference = memory_media(extract_audio(video_input, sample_start(input_path))) if remote else nullcontext(video_input)
-        with reference as sync_input:
-            result = subprocess.run(
-                [
-                    executable,
-                    sync_input,
-                    "-i",
-                    str(input_path),
-                    "-o",
-                    str(output_path),
-                    "--max-duration-seconds",
-                    # Includes at most 180s of synthesized silence before the
-                    # 15s sample, preserving timestamps after skipping an intro.
-                    "195" if remote else "300",
-                    "--frame-rate",
-                    "8000" if remote else "16000",
-                    "--skip-sync-on-low-quality",
-                    # A short sample can establish an offset, but cannot reliably
-                    # establish frame-rate drift over a whole movie.
-                    *(["--reference-stream", "0:a:0", "--no-fix-framerate", "--skip-infer-framerate-ratio"] if remote else []),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=20 if remote else 15 * 60,
-                check=False,
-            )
-        if result.returncode or not output_path.exists() or not output_path.stat().st_size:
-            raise PipelineError("Subtitle synchronization failed")
-    except subprocess.TimeoutExpired as exc:
-        raise PipelineError("Subtitle synchronization timed out") from exc
+        return sync_remote(video_input, input_path, output_path)
     except MediaReadError as exc:
         raise PipelineError(str(exc)) from exc
 
@@ -1719,7 +1793,7 @@ def process_video(
     source: MediaSource,
     opensubtitles: OpenSubtitles,
     progress: Callable[[str, str], None],
-    syncer: Callable[[str, Path, Path, Config], None] = sync_subtitle,
+    syncer: Callable[[str, Path, Path, Config], dict[str, Any] | None] = sync_subtitle,
     translator: Callable[..., dict[str, int]] = translate_srt,
     target_language: str | None = None,
     subtitle_mode: str | None = None,
@@ -1773,7 +1847,23 @@ def process_video(
             if subtitle_mode == "bilingual":
                 break
 
-    if english_sidecar:
+    embedded = None
+    languages = ("en",) if subtitle_mode == "bilingual" else (target_language, "en")
+    extract_embedded = getattr(source, "embedded_subtitle", None)
+    if extract_embedded:
+        progress("searching", "Checking the video's full subtitle tracks")
+        embedded = extract_embedded(relative, languages)
+
+    if embedded:
+        preferred = subtitle_output_filename(relative, target_language, subtitle_mode)
+        output_path = (numbered_output_path(preferred, destination.exists) if flat_output
+                       else language_output_path(relative, target_language, destination.exists, subtitle_mode))
+        candidate = SubtitleCandidate(0, embedded.language, f"Embedded subtitle: {embedded.name}", False)
+        subtitle_bytes = embedded.data
+        source_suffix = ".srt"
+        quota = {"remaining": None, "resetTimeUtc": None}
+        progress("downloading", "Using the video's embedded subtitle with its original timestamps")
+    elif english_sidecar:
         entry, subtitle_bytes = english_sidecar
         if flat_output:
             preferred = subtitle_output_filename(relative, target_language, subtitle_mode)
@@ -1802,6 +1892,7 @@ def process_video(
         subtitle_bytes, quota = opensubtitles.download(candidate)
         source_suffix = ".srt"
 
+    timing: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="cue-") as temp_dir:
         temp = Path(temp_dir)
         subtitle_source = temp / f"source{source_suffix}"
@@ -1809,7 +1900,10 @@ def process_video(
         final = temp / "final.srt"
         subtitle_source.write_bytes(subtitle_bytes)
 
-        if candidate.moviehash_match:
+        if embedded:
+            synced.write_bytes(subtitle_bytes)
+            progress("synchronizing", "Embedded subtitle; original video timing preserved")
+        elif candidate.moviehash_match:
             try:
                 subtitles = list(srt.parse(subtitle_source.read_text(encoding="utf-8-sig")))
                 if not subtitles:
@@ -1824,12 +1918,12 @@ def process_video(
                 progress("synchronizing", "Preparing video for bounded audio synchronization")
                 with source.sync_input(relative) as video_input:
                     progress("synchronizing", "Matching subtitles against a short audio sample")
-                    syncer(video_input, subtitle_source, synced, config)
+                    timing = syncer(video_input, subtitle_source, synced, config) or {}
         else:
             progress("synchronizing", "Preparing video for bounded audio synchronization")
             with source.sync_input(relative) as video_input:
                 progress("synchronizing", "Matching subtitles against a short audio sample")
-                syncer(video_input, subtitle_source, synced, config)
+                timing = syncer(video_input, subtitle_source, synced, config) or {}
         usage = {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
         if candidate.language == "en":
             progress("translating", f"Translating English cues to {target_name}")
@@ -1852,6 +1946,7 @@ def process_video(
         "sourceLanguage": candidate.language,
         "release": candidate.release,
         "moviehashMatch": candidate.moviehash_match,
+        "timing": timing,
         "quota": quota,
         "aiUsage": usage,
     }
@@ -2005,6 +2100,8 @@ def run_job(
                             item.message = "Existing target subtitle found"
                         elif result.get("reusedSourceSidecar"):
                             item.message = "Existing target subtitle copied"
+                        elif result.get("timing", {}).get("approximate"):
+                            item.message = "Subtitle created with approximate timing"
                         else:
                             item.message = "Subtitle created successfully"
                     item.result = result
@@ -2263,7 +2360,7 @@ def update_settings(body: SettingsRequest) -> dict[str, Any]:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    binaries = {"ffmpeg": bool(shutil.which("ffmpeg")), "ffsubsync": bool(shutil.which("ffsubsync"))}
+    binaries = {"ffmpeg": bool(shutil.which("ffmpeg")), "ffprobe": bool(shutil.which("ffprobe"))}
     with SERVICES_LOCK:
         config = CONFIG
         config_error = CONFIG_ERROR

@@ -60,7 +60,7 @@
     "setup": {
       "incomplete": "Backend setup is incomplete.",
       "ffmpegMissing": "FFmpeg is missing.",
-      "ffsubsyncMissing": "Run this command to install ffsubsync:"
+      "ffprobeMissing": "Install FFmpeg with ffprobe and make both available on PATH."
     },
     "browserLabel": "{{source}} video browser",
     "local": "Local",
@@ -152,7 +152,7 @@
     "next": "Continue",
     "finish": "Save and open library",
     "saveHint": "Your settings are saved when you finish setup.",
-    "servicesHint": "Saving validates your settings, but does not test service credentials. OpenSubtitles requires an account for downloads; FFmpeg and ffsubsync must be installed on the machine running Cue."
+    "servicesHint": "Saving validates your settings, but does not test service credentials. OpenSubtitles requires an account for downloads; FFmpeg and ffprobe must be installed on the machine running Cue."
   },
   "folderPicker": {
     "browseField": "Browse for {{field}}",

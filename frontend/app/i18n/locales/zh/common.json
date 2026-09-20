@@ -59,7 +59,7 @@
     "setup": {
       "incomplete": "后端设置尚未完成。",
       "ffmpegMissing": "缺少 FFmpeg。",
-      "ffsubsyncMissing": "运行以下命令安装 ffsubsync："
+      "ffprobeMissing": "请安装包含 ffprobe 的 FFmpeg，并确保两者均可通过 PATH 调用。"
     },
     "browserLabel": "{{source}} 视频浏览器",
     "local": "本地",
@@ -148,7 +148,7 @@
     "next": "继续",
     "finish": "保存并打开媒体库",
     "saveHint": "完成设置后才会保存您的配置。",
-    "servicesHint": "保存时会验证设置格式，但不会测试服务凭据。下载字幕需要 OpenSubtitles 账号；运行 Cue 的机器上必须安装 FFmpeg 和 ffsubsync。"
+    "servicesHint": "保存时会验证设置格式，但不会测试服务凭据。下载字幕需要 OpenSubtitles 账号；运行 Cue 的机器上必须安装 FFmpeg 和 ffprobe。"
   },
   "folderPicker": {
     "browseField": "浏览并选择{{field}}",

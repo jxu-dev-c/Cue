@@ -102,7 +102,7 @@ type Job = {
 type Health = {
   ready: boolean;
   configuration: string;
-  binaries: { ffmpeg: boolean; ffsubsync: boolean };
+  binaries: { ffmpeg: boolean; ffprobe: boolean };
 };
 
 type Option = { value: string; label: string };
@@ -623,7 +623,7 @@ export function Home() {
           <strong>{t("home.setup.incomplete")}</strong>
           <span>{health.configuration}</span>
           {!health.binaries.ffmpeg && <span>{t("home.setup.ffmpegMissing")}</span>}
-          {!health.binaries.ffsubsync && <span>{t("home.setup.ffsubsyncMissing")} <code>uv sync</code>.</span>}
+          {!health.binaries.ffprobe && <span>{t("home.setup.ffprobeMissing")}</span>}
         </section>
       )}
 
