@@ -38,6 +38,7 @@ import {
   rememberMediaDirectory,
 } from "./directoryRouting";
 import { AppHeader } from "./AppHeader";
+import { fetchEmbeddedSubtitleStream, shouldShowLanguageDash, type EmbeddedSubtitleCellState } from "./embeddedSubtitles";
 import {
   accumulateAiUsage,
   AI_USAGE_STORAGE_KEY,
@@ -111,6 +112,7 @@ type SettingsResponse = {
   values: Record<string, string>;
   options: { target_languages: Option[]; subtitle_modes: Option[] };
 };
+type MetadataLoad = { generation: number; path: string; refresh: boolean; videoPaths: string[] };
 type DirectoryLoadOptions = { refresh?: boolean; resetView?: boolean };
 
 const API = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
@@ -178,6 +180,7 @@ export function Home() {
   const { t, i18n } = useT("common");
   const pathname = usePathname();
   const directoryRequest = useRef(0);
+  const metadataAbort = useRef<AbortController | null>(null);
   const renameDialog = useRef<HTMLDialogElement>(null);
   const renameHelpDialog = useRef<HTMLDialogElement>(null);
   const jobsDock = useRef<HTMLDivElement>(null);
@@ -189,6 +192,8 @@ export function Home() {
   const [location, setLocation] = useState("");
   const [openingFolder, setOpeningFolder] = useState(false);
   const [entries, setEntries] = useState<FileEntry[]>([]);
+  const [embeddedMetadata, setEmbeddedMetadata] = useState<Record<string, EmbeddedSubtitleCellState>>({});
+  const [metadataLoad, setMetadataLoad] = useState<MetadataLoad | null>(null);
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<EntrySort>({ key: "modified", direction: "desc" });
   const [languageColumnCollapsed, setLanguageColumnCollapsed] = useState(false);
@@ -218,6 +223,8 @@ export function Home() {
     { refresh = false, resetView = true }: DirectoryLoadOptions = {},
   ) => {
     const request = ++directoryRequest.current;
+    metadataAbort.current?.abort();
+    setMetadataLoad(null);
     setRefreshing(refresh);
     setLoading(!refresh);
     setError("");
@@ -235,6 +242,9 @@ export function Home() {
       if (request !== directoryRequest.current) return;
       setPath(data.path);
       setEntries(data.entries);
+      const videoPaths = data.entries.filter((entry) => entry.type === "video").map((entry) => entry.path);
+      setEmbeddedMetadata(Object.fromEntries(videoPaths.map((videoPath) => [videoPath, { status: "loading" }])));
+      setMetadataLoad({ generation: request, path: data.path, refresh, videoPaths });
       setLocation(data.location);
       rememberMediaDirectory(sessionStorage, data.path);
     } catch (reason) {
@@ -247,6 +257,47 @@ export function Home() {
       }
     }
   }, [t]);
+
+  useEffect(() => {
+    if (!metadataLoad) return;
+    const controller = new AbortController();
+    const videoPaths = new Set(metadataLoad.videoPaths);
+    metadataAbort.current = controller;
+
+    const finishPending = () => {
+      if (directoryRequest.current !== metadataLoad.generation) return;
+      setEmbeddedMetadata((current) => Object.fromEntries(Object.entries(current).map(([videoPath, value]) => [
+        videoPath,
+        value.status === "loading"
+          ? { path: videoPath, status: "unavailable", languages: [] }
+          : value,
+      ])));
+    };
+
+    const timer = window.setTimeout(() => {
+      const query = new URLSearchParams({ path: metadataLoad.path });
+      if (metadataLoad.refresh) query.set("refresh", "true");
+      void fetchEmbeddedSubtitleStream(
+        `${API}/api/files/embedded-subtitles?${query}`,
+        controller.signal,
+        (metadata) => {
+          if (
+            directoryRequest.current !== metadataLoad.generation
+            || !videoPaths.has(metadata.path)
+          ) return;
+          setEmbeddedMetadata((current) => ({ ...current, [metadata.path]: metadata }));
+        },
+      ).then(finishPending).catch((reason: unknown) => {
+        if ((reason as Error)?.name !== "AbortError") finishPending();
+      });
+    }, 0);
+
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+      if (metadataAbort.current === controller) metadataAbort.current = null;
+    };
+  }, [metadataLoad]);
 
   function navigateDirectory(nextPath: string) {
     const href = directoryPathname(nextPath, i18n.language);
@@ -758,7 +809,7 @@ export function Home() {
               <span>{formatSize(entry.size)}</span>
               <span>{entry.modified ? new Date(entry.modified).toLocaleDateString(i18n.language) : "—"}</span>
               <span className="languageCell">
-                {entry.subtitles?.length ? entry.subtitles.map((subtitle) => {
+                {(entry.subtitles ?? []).map((subtitle) => {
                   const language = getSubtitleLanguage(subtitle.language);
                   return (
                     <span
@@ -771,7 +822,23 @@ export function Home() {
                       {language.flag}
                     </span>
                   );
-                }) : <span aria-label={t("home.noSidecarSubtitle")}>—</span>}
+                })}
+                {embeddedMetadata[entry.path]?.status === "loading" && (
+                  <span className="skeleton languageProbeSkeleton" role="status" aria-label={t("home.loadingEmbeddedSubtitles")} />
+                )}
+                {(() => {
+                  const embedded = embeddedMetadata[entry.path];
+                  return embedded?.status === "available" && embedded.languages.map((code, index) => {
+                    const language = getSubtitleLanguage(code);
+                    return <span className="languageFlag" role="img"
+                      aria-label={t("home.embeddedSubtitleLabel", { language: language.label })}
+                      title={t("home.embeddedSubtitleTitle", { language: language.label })}
+                      key={`embedded-${index}`}>{language.flag}</span>;
+                  });
+                })()}
+                {shouldShowLanguageDash(entry.subtitles?.length ?? 0, embeddedMetadata[entry.path]) && (
+                  <span aria-label={t("home.noSidecarSubtitle")}>—</span>
+                )}
               </span>
             </label>
           ))}

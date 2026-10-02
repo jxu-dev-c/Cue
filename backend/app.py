@@ -15,7 +15,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -31,7 +31,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from guessit import guessit
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -42,6 +42,7 @@ from backend.config_storage import config_path
 from backend.media_range import MediaReadError, remote_media
 from backend.subtitle_sync import sync_remote
 from backend.embedded_subtitles import EmbeddedSubtitle, SparseReader, extract_indexed
+from backend.embedded_metadata import EmbeddedSubtitleMetadata, probe_embedded_subtitles
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 CONFIG_PATH = config_path(Path.home())
@@ -69,7 +70,7 @@ TARGET_LANGUAGES = {
     "uk": ("Ukrainian", "uk"),
     "cs": ("Czech", "cs"),
 }
-SUBTITLE_MODES = {"target": "Target language only", "bilingual": "English & target language"}
+SUBTITLE_MODES = {"target": "Target language only", "bilingual": "English & target language", "minimalistic": "Minimalistic"}
 SETTING_DEFAULTS = {
     "source_type": "webdav",
     "subtitle_destination": "source",
@@ -86,6 +87,7 @@ SETTING_DEFAULTS = {
     "openai_rename_reasoning_effort": "low",
     "target_language": "zh-cn",
     "default_subtitle_mode": "bilingual",
+    "minimal_frequency_tier": "2000",
 }
 SECRET_SETTINGS = ("webdav_password", "opensubtitles_api_key", "opensubtitles_password", "openai_api_key")
 SECRET_ENV_NAMES = {key: key.upper() for key in SECRET_SETTINGS}
@@ -115,6 +117,13 @@ MAX_SUBTITLE_FONT_SIZE = 144
 SUBTITLE_HEIGHT_RATIO = 0.045
 DAV = "{DAV:}"
 LOGGER = logging.getLogger("uvicorn.error")
+FREQUENCY_PATH = BASE_DIR / "backend" / "frequency_data.json"
+FREQUENCY_DATA: dict[str, Any] = {}
+FREQUENCY_READY = threading.Event()
+FREQUENCY_ERROR: str | None = None
+WORD_PATTERN = re.compile(r"\*|[A-Za-z]+(?:['’][A-Za-z]+)*")
+
+FREQUENCY_LOCK = threading.Lock()
 
 
 def apply_unix_permissions(path: Path, mode: int) -> None:
@@ -130,6 +139,44 @@ def apply_unix_permissions(path: Path, mode: int) -> None:
 
 class PipelineError(RuntimeError):
     pass
+
+
+def phrase_pattern(value: str, lemmas: dict[str, str]) -> tuple[str, ...]:
+    value = re.sub(r"\([^)]*\)", "", value.replace("*self", "*"))
+    value = re.sub(r"([A-Za-z’']+)/[A-Za-z’']+", r"\1", value)
+    return tuple("*" if token == "*" else lemmas.get(token.casefold(), token.casefold()) for token in WORD_PATTERN.findall(value))
+
+
+def load_frequency_data(path: Path = FREQUENCY_PATH) -> None:
+    global FREQUENCY_DATA, FREQUENCY_ERROR
+    FREQUENCY_READY.clear()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        words, lemmas, phrases = payload["words"], payload["lemmas"], payload["phrases"]
+        if payload.get("_meta", {}).get("ngsl_headwords") != 2809 or len(phrases) < 500:
+            raise ValueError("frequency data was incomplete")
+        patterns: dict[tuple[str, ...], int] = {}
+        for phrase, rank in phrases.items():
+            pattern = phrase_pattern(phrase, lemmas)
+            if len(pattern) > 1:
+                patterns[pattern] = max(patterns.get(pattern, 0), int(rank))
+        FREQUENCY_DATA = {"words": words, "lemmas": lemmas, "phrases": patterns}
+        FREQUENCY_ERROR = None
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        FREQUENCY_DATA = {}
+        FREQUENCY_ERROR = str(exc)
+    finally:
+        FREQUENCY_READY.set()
+
+
+def frequency_data() -> dict[str, Any]:
+    if not FREQUENCY_READY.is_set():
+        with FREQUENCY_LOCK:
+            if not FREQUENCY_READY.is_set():
+                load_frequency_data()
+    if FREQUENCY_ERROR:
+        raise PipelineError("Could not load Minimalistic frequency data")
+    return FREQUENCY_DATA
 
 
 def read_bounded_response(response: httpx.Response, limit: int, message: str) -> bytes:
@@ -235,6 +282,7 @@ class Config:
     subtitle_destination: str = "source"
     local_scan_path: str = ""
     local_output_path: str = ""
+    minimal_frequency_tier: int = 2000
 
     @classmethod
     def load(cls) -> "Config":
@@ -289,6 +337,12 @@ class Config:
         subtitle_mode = values["default_subtitle_mode"].strip().lower()
         if subtitle_mode not in SUBTITLE_MODES:
             raise PipelineError("Default subtitle mode is invalid")
+        try:
+            minimal_frequency_tier = int(values.get("minimal_frequency_tier", "2000"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PipelineError("Minimalistic frequency tier is invalid") from exc
+        if minimal_frequency_tier not in {1000, 2000, 3000, 4000, 5000}:
+            raise PipelineError("Minimalistic frequency tier is invalid")
 
         local_scan_path = ""
         local_output_path = ""
@@ -315,6 +369,7 @@ class Config:
             openai_rename_reasoning_effort=rename_effort,
             target_language=target_language,
             default_subtitle_mode=subtitle_mode,
+            minimal_frequency_tier=minimal_frequency_tier,
             opensubtitles_username=values.get("opensubtitles_username") or None,
             opensubtitles_password=secrets.get("opensubtitles_password") or None,
             source_type=source_type,
@@ -346,6 +401,7 @@ class MediaSource(Protocol):
     def sidecars(self, video_path: str) -> list[FileEntry]: ...
     def file_info(self, relative: str) -> FileEntry: ...
     def exists(self, relative: str) -> bool: ...
+    def read_range(self, relative: str, start: int, end: int, timeout: float | None = None) -> bytes: ...
     def moviehash(self, relative: str, size: int) -> str: ...
     def read_small(self, relative: str, limit: int = MAX_SUBTITLE_BYTES) -> bytes: ...
     def sync_input(self, relative: str) -> ContextManager[str]: ...
@@ -461,6 +517,8 @@ def apply_subtitle_font_size(path: Path, video_path: str) -> None:
 def subtitle_output_filename(video_path: str, target_language: str, subtitle_mode: str = "target") -> str:
     video = PurePosixPath(normalize_relative(video_path))
     language_postfix = TARGET_LANGUAGES[target_language][1]
+    if subtitle_mode == "minimalistic":
+        return f"{video.stem}.minimal.{language_postfix}.ass"
     if subtitle_mode == "bilingual":
         language_postfix = f"{language_postfix}.en"
     return f"{video.stem}.{language_postfix}.srt"
@@ -542,6 +600,11 @@ def detect_sidecar_language_from_name(video_name: str, subtitle_name: str) -> st
             continue
         selected.append((start, code))
         claimed.append((start, end))
+    # Minimalistic ASS contains English dialogue plus target-language glosses,
+    # so it must not be reused as a complete target-language source.
+    if ".minimal." in markers and PurePosixPath(subtitle_name).suffix.casefold() == ".ass" and selected:
+        if not any(code == "en" for _, code in selected):
+            selected.append((len(markers), "en"))
     return "+".join(code for _, code in sorted(selected)) or None
 
 
@@ -797,10 +860,11 @@ class WebDAV:
             return False
         raise PipelineError(f"WebDAV could not check the output path ({response.status_code})")
 
-    def _open_media(self, relative: str, headers: dict[str, str]) -> httpx.Response:
+    def _open_media(self, relative: str, headers: dict[str, str], timeout: float | None = None) -> httpx.Response:
         url = self.url_for(relative)
         try:
-            request = self.client.build_request("GET", url, headers=headers)
+            options = {"timeout": timeout} if timeout is not None else {}
+            request = self.client.build_request("GET", url, headers=headers, **options)
             response = self.client.send(request, stream=True, follow_redirects=False)
         except httpx.HTTPError as exc:
             raise PipelineError("WebDAV media request failed") from exc
@@ -812,7 +876,7 @@ class WebDAV:
                 raise PipelineError("WebDAV returned an unsafe media redirect")
             try:
                 # The CDN request deliberately uses a client with no WebDAV auth.
-                request = self.media_client.build_request("GET", target.geturl(), headers=headers)
+                request = self.media_client.build_request("GET", target.geturl(), headers=headers, **options)
                 response = self.media_client.send(request, stream=True, follow_redirects=False)
             except httpx.HTTPError as exc:
                 raise PipelineError("WebDAV media redirect failed") from exc
@@ -821,8 +885,8 @@ class WebDAV:
                 raise PipelineError("WebDAV media redirected more than once")
         return response
 
-    def read_range(self, relative: str, start: int, end: int) -> bytes:
-        response = self._open_media(relative, {"Range": f"bytes={start}-{end}"})
+    def read_range(self, relative: str, start: int, end: int, timeout: float | None = None) -> bytes:
+        response = self._open_media(relative, {"Range": f"bytes={start}-{end}"}, timeout=timeout)
         try:
             if response.status_code != 206:
                 raise PipelineError("WebDAV server does not support required byte ranges")
@@ -1013,6 +1077,21 @@ class LocalStorage:
 
     def exists(self, relative: str) -> bool:
         return self._path(relative).exists()
+
+    def read_range(self, relative: str, start: int, end: int, timeout: float | None = None) -> bytes:
+        del timeout
+        if start < 0 or end < start:
+            raise PipelineError("Invalid local byte range")
+        path = self._path(relative, must_exist=True)
+        try:
+            with path.open("rb") as media:
+                media.seek(start)
+                data = media.read(end - start + 1)
+        except OSError as exc:
+            raise PipelineError("Could not read the local video range") from exc
+        if len(data) != end - start + 1:
+            raise PipelineError("Local video range was incomplete")
+        return data
 
     def moviehash(self, relative: str, size: int) -> str:
         path = self._path(relative, must_exist=True)
@@ -1647,6 +1726,147 @@ def translation_schema() -> dict[str, Any]:
     }
 
 
+def minimalistic_schema() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "subtitle_glosses",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "translations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer"},
+                                "glosses": {
+                                    "type": "array",
+                                    "maxItems": 3,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "candidate": {"type": "integer"},
+                                            "text": {"type": "string"},
+                                        },
+                                        "required": ["candidate", "text"],
+                                        "additionalProperties": False,
+                                    },
+                                },
+                            },
+                            "required": ["id", "glosses"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["translations"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def minimalistic_instructions(target_language: str) -> str:
+    return (
+        f"For each English subtitle cue, choose up to three supplied candidates that most help comprehension and translate only those "
+        f"into concise {TARGET_LANGUAGES[target_language][0]} glosses. Omit names, acronyms, and items that should not be translated. "
+        "Keep each candidate id unchanged, return every cue id exactly once, and output only the required JSON schema."
+    )
+
+
+def plain_subtitle_text(value: str) -> str:
+    value = re.sub(r"\{\\[^}]*\}", "", value)
+    return " ".join(re.sub(r"<[^>]+>", "", value).replace("\\N", "\n").split())
+
+
+def minimal_candidates(text: str, data: dict[str, Any], tier: int) -> tuple[str, list[dict[str, Any]]]:
+    plain = plain_subtitle_text(text)
+    matches = list(WORD_PATTERN.finditer(plain))
+    lemmas = [data["lemmas"].get(match.group().casefold(), match.group().casefold()) for match in matches]
+    candidates: list[dict[str, Any]] = []
+    occupied: set[int] = set()
+    # 506 patterns are faster and simpler to scan than maintaining a phrase trie.
+    for pattern, rank in sorted(data["phrases"].items(), key=lambda item: len(item[0]), reverse=True):
+        if rank <= tier or len(pattern) > len(matches):
+            continue
+        for start in range(len(matches) - len(pattern) + 1):
+            indexes = range(start, start + len(pattern))
+            if occupied.intersection(indexes) or any(expected != "*" and expected != lemmas[index] for index, expected in zip(indexes, pattern)):
+                continue
+            candidates.append({
+                "start": matches[start].start(),
+                "end": matches[start + len(pattern) - 1].end(),
+                "rank": rank,
+                "kind": "phrase",
+            })
+            occupied.update(indexes)
+
+    for index, match in enumerate(matches):
+        word = match.group()
+        rank = data["words"].get(word.casefold())
+        if index in occupied or len(word.strip("'’")) < 2 or (rank is not None and rank <= tier):
+            continue
+        if word.isupper() or (word[0].isupper() and match.start() > 0 and plain[match.start() - 1] not in ".!?\n"):
+            continue
+        candidates.append({"start": match.start(), "end": match.end(), "rank": rank, "kind": "word"})
+
+    candidates.sort(key=lambda item: item["start"])
+    for candidate_id, candidate in enumerate(candidates):
+        candidate["id"] = candidate_id
+        candidate["text"] = plain[candidate["start"] : candidate["end"]]
+    return plain, candidates
+
+
+def ass_time(value: Any) -> str:
+    centiseconds = max(0, int(value.total_seconds() * 100))
+    minutes, seconds = divmod(centiseconds, 6000)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02}:{seconds // 100:02}.{seconds % 100:02}"
+
+
+def ass_text(value: str) -> str:
+    return value.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+
+
+def render_minimalistic_ass(subtitles: list[srt.Subtitle], glosses: dict[int, list[dict[str, Any]]]) -> str:
+    output = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "PlayResX: 1920",
+        "PlayResY: 1080",
+        "ScaledBorderAndShadow: yes",
+        "WrapStyle: 2",
+        "",
+        "[V4+ Styles]",
+        "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
+        "Style: English,Courier New,48,&H00FFFFFF,&H000000FF,&H00101010,&H80000000,0,0,0,0,100,100,0,0,1,2,1,5,20,20,40,1",
+        "",
+        "[Events]",
+        "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
+    ]
+    for cue_id, subtitle in enumerate(subtitles):
+        plain = plain_subtitle_text(subtitle.content)
+        if not plain:
+            continue
+        start, end = ass_time(subtitle.start), ass_time(subtitle.end)
+        font_size = max(18, min(48, int(1840 / (len(plain) * 0.6))))
+        x, y = round(960 - len(plain) * font_size * 0.3), 1010
+        output.append(f"Dialogue: 0,{start},{end},English,,0,0,0,,{{\\an4\\pos({x},{y})\\fs{font_size}}}{ass_text(plain)}")
+        for gloss in glosses.get(cue_id, []):
+            translation = gloss["translation"]
+            scale_x = max(1, round((gloss["end"] - gloss["start"]) * 60 / len(translation)))
+            copied_line = (
+                ass_text(plain[:gloss["start"]])
+                + f"{{\\alpha&H00&\\1c&H00B8E7FF&\\fscx{scale_x}\\fscy58}}{ass_text(translation)}"
+                + f"{{\\alpha&HFF&\\fscx100\\fscy100}}{ass_text(plain[gloss['end']:])}"
+            )
+            output.append(
+                f"Dialogue: 1,{start},{end},English,,0,0,0,,{{\\an4\\pos({x},{y - font_size})\\fs{font_size}\\alpha&HFF&}}{copied_line}"
+            )
+    return "\n".join(output) + "\n"
+
+
 def translate_srt(
     input_path: Path,
     output_path: Path,
@@ -1655,6 +1875,7 @@ def translate_srt(
     *,
     target_language: str | None = None,
     subtitle_mode: str | None = None,
+    frequency: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     target_language = target_language or config.target_language
     subtitle_mode = subtitle_mode or config.default_subtitle_mode
@@ -1662,6 +1883,20 @@ def translate_srt(
     indexed = list(enumerate(subtitles))
     if not indexed:
         raise PipelineError("Downloaded subtitle contains no cues")
+    usage = {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
+    candidates: dict[int, dict[int, dict[str, Any]]] = {}
+    work = indexed
+    if subtitle_mode == "minimalistic":
+        data = frequency if frequency is not None else frequency_data()
+        work = []
+        for cue_id, subtitle in indexed:
+            _, cue_candidates = minimal_candidates(subtitle.content, data, config.minimal_frequency_tier)
+            if cue_candidates:
+                candidates[cue_id] = {candidate["id"]: candidate for candidate in cue_candidates}
+                work.append((cue_id, subtitle))
+        if not work:
+            output_path.write_text(render_minimalistic_ass(subtitles, {}), encoding="utf-8", newline="\n")
+            return usage
     owns_client = client is None
     client = client or OpenAI(
         api_key=config.openai_api_key,
@@ -1669,10 +1904,9 @@ def translate_srt(
         max_retries=2,
         timeout=90,
     )
-    usage = {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
-    translations: dict[int, str] = {}
+    translations: dict[int, Any] = {}
 
-    def translate_batch(batch: list[tuple[int, srt.Subtitle]]) -> tuple[dict[int, str], dict[str, int]]:
+    def translate_batch(batch: list[tuple[int, srt.Subtitle]]) -> tuple[dict[int, Any], dict[str, int]]:
         batch_usage = {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
         first_id = batch[0][0]
         expected = {cue_id for cue_id, _ in batch}
@@ -1682,12 +1916,21 @@ def translate_srt(
             )[-TRANSLATION_CONTEXT_CHARS:],
             "cues": [{"id": cue_id, "text": cue.content} for cue_id, cue in batch],
         }
-        instructions = translation_instructions(target_language)
+        if subtitle_mode == "minimalistic":
+            payload["cues"] = [
+                {"id": cue_id, "text": plain_subtitle_text(cue.content), "candidates": [
+                    {"id": candidate["id"], "text": candidate["text"], "rank": candidate["rank"]}
+                    for candidate in candidates[cue_id].values()
+                ]}
+                for cue_id, cue in batch
+            ]
+        instructions = (minimalistic_instructions(target_language) if subtitle_mode == "minimalistic"
+                        else translation_instructions(target_language))
         error: Exception | None = None
         for attempt in range(3):
             retry_instructions = (
                 "\n\nThe previous response failed validation: " + str(error) + ". "
-                "Translate all requested cues again, with their original ids and non-empty text."
+                "Return all requested cues again with their original ids and the required schema."
                 if error is not None else ""
             )
             try:
@@ -1698,7 +1941,7 @@ def translate_srt(
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
                     ],
                     reasoning_effort=config.openai_reasoning_effort,
-                    response_format=translation_schema(),
+                    response_format=minimalistic_schema() if subtitle_mode == "minimalistic" else translation_schema(),
                     store=False,
                     max_completion_tokens=16_000,
                     n=1,
@@ -1721,8 +1964,25 @@ def translate_srt(
                     or len(received) != len(expected)
                 ):
                     raise ValueError("translation ids did not match the request")
-                translated_batch: dict[int, str] = {}
+                translated_batch: dict[int, Any] = {}
                 for row in rows:
+                    if subtitle_mode == "minimalistic":
+                        selected = row.get("glosses")
+                        if not isinstance(selected, list) or len(selected) > 3:
+                            raise ValueError("glosses were invalid")
+                        selected_ids = [item.get("candidate") for item in selected if isinstance(item, dict)]
+                        if (len(selected_ids) != len(selected)
+                                or any(type(value) is not int for value in selected_ids)
+                                or len(set(selected_ids)) != len(selected_ids)):
+                            raise ValueError("gloss candidate ids were invalid")
+                        glosses = []
+                        for item in selected:
+                            candidate = candidates[row["id"]].get(item["candidate"])
+                            if not candidate or not isinstance(item.get("text"), str) or not item["text"].strip():
+                                raise ValueError("gloss translation was invalid")
+                            glosses.append(candidate | {"translation": " ".join(item["text"].split())})
+                        translated_batch[row["id"]] = glosses
+                        continue
                     if not isinstance(row.get("text"), str) or not row["text"].strip():
                         raise ValueError(f"translation text for id {row['id']} must be a non-empty string")
                     translated_batch[row["id"]] = row["text"].strip()
@@ -1743,7 +2003,7 @@ def translate_srt(
                 batch_usage[key] += part_usage[key]
         return translated, batch_usage
 
-    batches = iter(batch_cues(indexed))
+    batches = iter(batch_cues(work))
     try:
         # Only keep a bounded window in flight. Merge on this thread by cue ID,
         # so out-of-order responses never change cue order or timestamps.
@@ -1767,6 +2027,10 @@ def translate_srt(
     finally:
         if owns_client:
             client.close()
+
+    if subtitle_mode == "minimalistic":
+        output_path.write_text(render_minimalistic_ass(subtitles, translations), encoding="utf-8", newline="\n")
+        return usage
 
     for cue_id, subtitle in indexed:
         translated = translations[cue_id]
@@ -1848,7 +2112,7 @@ def process_video(
                 break
 
     embedded = None
-    languages = ("en",) if subtitle_mode == "bilingual" else (target_language, "en")
+    languages = ("en",) if subtitle_mode != "target" else (target_language, "en")
     extract_embedded = getattr(source, "embedded_subtitle", None)
     if extract_embedded:
         progress("searching", "Checking the video's full subtitle tracks")
@@ -1886,7 +2150,7 @@ def process_video(
         progress("hashing", "Reading the first and last 64 KiB")
         moviehash = source.moviehash(relative, info.size or 0)
         progress("searching", "Finding an exact subtitle match")
-        languages = ("en",) if subtitle_mode == "bilingual" else (target_language, "en")
+        languages = ("en",) if subtitle_mode != "target" else (target_language, "en")
         candidate = opensubtitles.find(info.name, moviehash, languages)
         progress("downloading", f"Downloading {candidate.language} subtitle")
         subtitle_bytes, quota = opensubtitles.download(candidate)
@@ -1897,7 +2161,7 @@ def process_video(
         temp = Path(temp_dir)
         subtitle_source = temp / f"source{source_suffix}"
         synced = temp / "synced.srt"
-        final = temp / "final.srt"
+        final = temp / ("final.ass" if subtitle_mode == "minimalistic" else "final.srt")
         subtitle_source.write_bytes(subtitle_bytes)
 
         if embedded:
@@ -1937,7 +2201,8 @@ def process_video(
         else:
             shutil.copyfile(synced, final)
 
-        apply_subtitle_font_size(final, relative)
+        if subtitle_mode != "minimalistic":
+            apply_subtitle_font_size(final, relative)
         progress("saving", f"Saving {PurePosixPath(output_path).name}")
         destination.put(output_path, final.read_bytes())
 
@@ -1969,6 +2234,83 @@ WEBDAV: WebDAV | None = None
 OPENSUBTITLES: OpenSubtitles | None = None
 
 
+EMBEDDED_METADATA_CACHE_TTL_SECONDS = 24 * 60 * 60
+EMBEDDED_METADATA_FAILURE_TTL_SECONDS = 60
+EMBEDDED_METADATA_CACHE_MAX_ENTRIES = 1024
+EmbeddedMetadataCacheKey = tuple[int, str, int, str | None]
+EMBEDDED_METADATA_CACHE: OrderedDict[
+    EmbeddedMetadataCacheKey,
+    tuple[float, EmbeddedSubtitleMetadata],
+] = OrderedDict()
+EMBEDDED_METADATA_INFLIGHT: dict[
+    EmbeddedMetadataCacheKey,
+    Future[EmbeddedSubtitleMetadata],
+] = {}
+EMBEDDED_METADATA_LOCK = threading.Lock()
+EMBEDDED_METADATA_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="embedded-metadata")
+
+
+def clear_embedded_metadata_cache() -> None:
+    with EMBEDDED_METADATA_LOCK:
+        EMBEDDED_METADATA_CACHE.clear()
+
+
+def _probe_embedded_metadata(source: MediaSource, entry: FileEntry) -> EmbeddedSubtitleMetadata:
+    return probe_embedded_subtitles(
+        entry.path,
+        entry.size,
+        lambda start, end, timeout: source.read_range(entry.path, start, end, timeout=timeout),
+    )
+
+
+def _store_embedded_metadata(
+    key: EmbeddedMetadataCacheKey,
+    future: Future[EmbeddedSubtitleMetadata],
+) -> None:
+    try:
+        result = future.result()
+    except Exception:
+        result = EmbeddedSubtitleMetadata("unavailable")
+    ttl = (
+        EMBEDDED_METADATA_FAILURE_TTL_SECONDS
+        if result.status == "unavailable"
+        else EMBEDDED_METADATA_CACHE_TTL_SECONDS
+    )
+    with EMBEDDED_METADATA_LOCK:
+        if EMBEDDED_METADATA_INFLIGHT.get(key) is future:
+            EMBEDDED_METADATA_INFLIGHT.pop(key, None)
+        EMBEDDED_METADATA_CACHE[key] = (time.monotonic() + ttl, result)
+        EMBEDDED_METADATA_CACHE.move_to_end(key)
+        while len(EMBEDDED_METADATA_CACHE) > EMBEDDED_METADATA_CACHE_MAX_ENTRIES:
+            EMBEDDED_METADATA_CACHE.popitem(last=False)
+
+
+def request_embedded_metadata(
+    source: MediaSource,
+    entry: FileEntry,
+    *,
+    refresh: bool = False,
+) -> Future[EmbeddedSubtitleMetadata]:
+    key = (id(source), entry.path, entry.size or 0, entry.modified)
+    with EMBEDDED_METADATA_LOCK:
+        cached = EMBEDDED_METADATA_CACHE.get(key)
+        if refresh:
+            EMBEDDED_METADATA_CACHE.pop(key, None)
+        elif cached and cached[0] > time.monotonic():
+            EMBEDDED_METADATA_CACHE.move_to_end(key)
+            completed: Future[EmbeddedSubtitleMetadata] = Future()
+            completed.set_result(cached[1])
+            return completed
+        elif cached:
+            EMBEDDED_METADATA_CACHE.pop(key, None)
+        if pending := EMBEDDED_METADATA_INFLIGHT.get(key):
+            return pending
+        future = EMBEDDED_METADATA_EXECUTOR.submit(_probe_embedded_metadata, source, entry)
+        EMBEDDED_METADATA_INFLIGHT[key] = future
+    future.add_done_callback(lambda completed, cache_key=key: _store_embedded_metadata(cache_key, completed))
+    return future
+
+
 def reload_services(config: Config) -> None:
     """Build a complete service set, then expose it to new requests at once."""
     source, destination = build_storage(config)
@@ -1979,6 +2321,7 @@ def reload_services(config: Config) -> None:
         CONFIG, CONFIG_ERROR = config, None
         SOURCE, DESTINATION = source, destination
         WEBDAV, OPENSUBTITLES = webdav, opensubtitles
+    clear_embedded_metadata_cache()
 
 
 try:
@@ -2385,6 +2728,50 @@ def files(path: str = Query(default=""), refresh: bool = Query(default=False)) -
         return {"path": relative, "entries": entries, "location": location}
     except PipelineError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/files/embedded-subtitles")
+def embedded_subtitle_metadata(
+    path: str = Query(default=""),
+    refresh: bool = Query(default=False),
+) -> StreamingResponse:
+    _, source, _, _ = require_services()
+    try:
+        relative = normalize_relative(path)
+        entries = [entry for entry in source.list(relative) if entry.type == "video"]
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    pending = {
+        request_embedded_metadata(source, entry, refresh=refresh): entry
+        for entry in entries
+    }
+
+    def body() -> Iterable[bytes]:
+        for future in as_completed(pending):
+            entry = pending[future]
+            try:
+                result = future.result()
+            except Exception:
+                result = EmbeddedSubtitleMetadata("unavailable")
+            yield (
+                json.dumps(
+                    {
+                        "path": entry.path,
+                        "status": result.status,
+                        "languages": result.languages,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+
+    return StreamingResponse(
+        body(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @app.post("/api/folders/open")

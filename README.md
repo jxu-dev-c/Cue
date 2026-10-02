@@ -5,8 +5,9 @@
 Cue is a local web app for videos on WebDAV or your own filesystem. Choose a language, select your videos, and let Cue handle the subtitles.
 
 - **Find subtitles** from existing sidecars, complete indexed MKV text tracks, or OpenSubtitles.
+- **See subtitle languages** from sidecars and embedded MKV/WebM/MP4 tracks while browsing.
 - **Sync locally** using short audio samples.
-- **Translate English** through a configurable Chat Completions endpoint, with target-only or bilingual output.
+- **Translate English** through a configurable Chat Completions endpoint, with target-only, bilingual, or Minimalistic output.
 - **Process multiple videos** in sequence; one failed video won't stop the rest.
 - **Keep your library organized** with language-tagged filenames and Smart Rename. Existing subtitle files are never overwritten.
 
@@ -55,6 +56,10 @@ Output names include the language: `Movie.es.srt` or `Movie.es.en.srt` for bilin
 - Cue runs on **localhost / 127.0.0.1**. Keep the server running while using it.
 
 To use Cue in its own window, open the production app and choose your browser's **Install Cue** action, or **File → Add to Dock** in macOS Safari. The installed app still requires the server; uninstalling it preserves server settings.
+
+Minimalistic mode uses English sources and creates an Infuse-compatible `.ass` sidecar. It checks NGSL word ranks and PHRASE List expression ranks, asks AI to gloss at most three difficult items per cue, and positions the smaller translations above the matching English spans. Configure the 1K–5K cutoff in Settings; the default translates vocabulary beyond the top 2K.
+
+The bundled frequency snapshot uses [NGSL 1.2](https://www.newgeneralservicelist.com/new-general-service-list) by Browne, Culligan, and Phillips under CC BY-SA 4.0, plus the [PHRASE List](https://www.lextutor.ca/freq/lists_download/phrase_list_martinez.htm) by Ron Martinez and Norbert Schmitt. The normalized dictionaries load from disk on first use; no dataset network request occurs at runtime.
 
 ## Running on a trusted private network
 

@@ -22,7 +22,7 @@ const homeSource = ts.transpileModule(
 ).outputText;
 
 // Mount the real Home component, replacing only its Next shell and HTTP boundary.
-async function mountHome(t, kind, terminalStatus, error) {
+async function mountHome(t, kind, terminalStatus, error, embeddedLanguages = []) {
   const dom = new JSDOM("<div id='root'></div>", { url: "http://localhost/Series/" });
   dom.window.HTMLDialogElement.prototype.showModal = function () { this.setAttribute("open", ""); };
   dom.window.HTMLDialogElement.prototype.close = function () { this.removeAttribute("open"); };
@@ -41,12 +41,13 @@ async function mountHome(t, kind, terminalStatus, error) {
   }
   dom.window.sessionStorage.setItem("cue-jobs", "job-1");
   const timers = new Map();
+  const metadataTimers = new Map();
   let timerId = 0;
-  dom.window.setTimeout = (callback) => {
-    timers.set(++timerId, callback);
+  dom.window.setTimeout = (callback, delay) => {
+    (delay === 0 ? metadataTimers : timers).set(++timerId, callback);
     return timerId;
   };
-  dom.window.clearTimeout = (id) => timers.delete(id);
+  dom.window.clearTimeout = (id) => { timers.delete(id); metadataTimers.delete(id); };
   let status = "queued";
   const fileRequests = [];
   const video = { name: "Episode.mkv", path: "Series/Episode.mkv", type: "video", subtitles: [] };
@@ -56,6 +57,12 @@ async function mountHome(t, kind, terminalStatus, error) {
     require(name) {
       if (name === "next-i18next/client") return { useT: () => translation };
       if (name === "next/navigation") return { usePathname: () => "/Series/" };
+      if (name === "./embeddedSubtitles") return {
+        ...require("./embeddedSubtitles.ts"),
+        async fetchEmbeddedSubtitleStream(_url, signal, onMetadata) {
+          if (!signal.aborted) onMetadata({ path: video.path, status: "available", languages: embeddedLanguages });
+        },
+      };
       if (name === "./AppHeader") return { AppHeader: ({ jobsControl }) => jobsControl };
       return require(name.startsWith("./") ? `${name}.ts` : name);
     },
@@ -65,6 +72,8 @@ async function mountHome(t, kind, terminalStatus, error) {
     sessionStorage: dom.window.sessionStorage,
     localStorage: dom.window.localStorage,
     Event: dom.window.Event,
+    AbortController,
+    URLSearchParams,
     async fetch(url) {
       let body;
       if (url === "/api/health") body = { ready: true };
@@ -99,7 +108,13 @@ async function mountHome(t, kind, terminalStatus, error) {
     dom.window.close();
     restoreGlobals.forEach((restore) => restore());
   });
+  async function flushMetadata() {
+    const callbacks = [...metadataTimers.values()];
+    metadataTimers.clear();
+    await act(async () => callbacks.forEach((callback) => callback()));
+  }
   await act(async () => root.render(React.createElement(exports.Home)));
+  await flushMetadata();
   return {
     document: dom.window.document,
     fileRequests,
@@ -108,6 +123,7 @@ async function mountHome(t, kind, terminalStatus, error) {
       const callbacks = [...timers.values()];
       timers.clear();
       await act(async () => callbacks.forEach((callback) => callback()));
+      await flushMetadata();
     },
   };
 }
@@ -170,3 +186,13 @@ for (const [error, showHelp] of [
     assert.equal(dialog.open, false);
   });
 }
+
+test("embedded languages appear beside bilingual sidecars after a job refresh", async (t) => {
+  const home = await mountHome(t, "subtitles", "completed", undefined, ["eng", "zh-Hans"]);
+  assert.ok(home.document.querySelector('[aria-label="English embedded subtitle"]'));
+  assert.ok(home.document.querySelector('[aria-label="Simplified Chinese embedded subtitle"]'));
+  assert.equal(home.document.querySelector('[aria-label="No sidecar subtitle"]'), null);
+  await home.poll("completed");
+  assert.ok(home.document.querySelector('[title="Simplified Chinese · Episode.zh-Hans.srt"]'));
+  assert.ok(home.document.querySelector('[aria-label="English embedded subtitle"]'));
+});

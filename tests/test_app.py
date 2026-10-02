@@ -36,6 +36,9 @@ from backend.app import (
     choose_output_path,
     detect_sidecar_language,
     detect_sidecar_language_from_name,
+    frequency_data,
+    load_frequency_data,
+    minimal_candidates,
     normalize_relative,
     numbered_output_path,
     process_video,
@@ -141,6 +144,7 @@ class CoreTests(unittest.TestCase):
             "openai_rename_reasoning_effort": "medium",
             "target_language": "zh-cn",
             "default_subtitle_mode": "bilingual",
+            "minimal_frequency_tier": "2000",
         }
         secrets = {
             "webdav_password": "webdav-secret",
@@ -158,6 +162,7 @@ class CoreTests(unittest.TestCase):
             defaults = get_settings()["values"]
             self.assertEqual(defaults["target_language"], "zh-cn")
             self.assertEqual(defaults["default_subtitle_mode"], "bilingual")
+            self.assertEqual(defaults["minimal_frequency_tier"], "2000")
             self.assertEqual(defaults["openai_rename_reasoning_effort"], "low")
             self.assertTrue(get_settings()["secrets"]["openai_api_key"])
             result = update_settings(SettingsRequest(values=values, secrets=secrets))
@@ -176,9 +181,9 @@ class CoreTests(unittest.TestCase):
                 "local_output_path": "",
             } | values)
             self.assertEqual(len(response["options"]["target_languages"]), 20)
-            self.assertEqual(response["options"]["subtitle_modes"][-1], {"value": "bilingual", "label": "English & target language"})
+            self.assertEqual(response["options"]["subtitle_modes"][-1], {"value": "minimalistic", "label": "Minimalistic"})
             self.assertTrue(all(response["secrets"].values()))
-            config_text = (Path(directory) / "config.json").read_text()
+            config_text = (Path(directory) / "config.json").read_text(encoding="utf-8")
             saved_config = json.loads(config_text)
             self.assertEqual(saved_config["webdav_password"], "webdav-secret")
             self.assertEqual(saved_config["opensubtitles_api_key"], "subtitle-key")
@@ -187,14 +192,14 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("openai_api_key", response["values"])
             if os.name != "nt":
                 self.assertEqual((Path(directory) / "config.json").stat().st_mode & 0o777, 0o600)
-            env_text = (Path(directory) / ".env").read_text()
+            env_text = (Path(directory) / ".env").read_text(encoding="utf-8")
             self.assertNotIn("OPENAI_API_KEY", env_text)
             self.assertIn("UNRELATED=value", env_text)
             if os.name != "nt":
                 self.assertEqual((Path(directory) / ".env").stat().st_mode & 0o777, 0o600)
 
             update_settings(SettingsRequest(values=values, clear_secrets=["opensubtitles_password"]))
-            self.assertNotIn("opensubtitles_password", json.loads((Path(directory) / "config.json").read_text()))
+            self.assertNotIn("opensubtitles_password", json.loads((Path(directory) / "config.json").read_text(encoding="utf-8")))
             with self.assertRaises(HTTPException) as raised:
                 update_settings(SettingsRequest(values=values | {"unknown": "value"}))
             self.assertEqual(raised.exception.status_code, 400)
@@ -203,6 +208,9 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(raised.exception.status_code, 400)
             with self.assertRaises(HTTPException) as raised:
                 update_settings(SettingsRequest(values=values | {"default_subtitle_mode": "invalid"}))
+            self.assertEqual(raised.exception.status_code, 400)
+            with self.assertRaises(HTTPException) as raised:
+                update_settings(SettingsRequest(values=values | {"minimal_frequency_tier": "2500"}))
             self.assertEqual(raised.exception.status_code, 400)
             with self.assertRaises(HTTPException) as raised:
                 update_settings(SettingsRequest(values=values | {"openai_rename_reasoning_effort": "invalid"}))
@@ -940,7 +948,7 @@ class PipelineTests(unittest.TestCase):
 
         def translator(source, destination, _, **options):
             self.assertEqual(options["subtitle_mode"], "bilingual")
-            destination.write_text(source.read_text() + "\nTranslated", encoding="utf-8")
+            destination.write_text(source.read_text(encoding="utf-8") + "\nTranslated", encoding="utf-8")
             return {"promptTokens": 1, "completionTokens": 1, "totalTokens": 2}
 
         result = process_video(
@@ -956,6 +964,68 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["outputPath"], "Movie.zh-Hans.en.srt")
         self.assertIn(b"Translated", webdav.uploads["Movie.zh-Hans.en.srt"])
 
+    def test_minimalistic_uses_english_and_uploads_ass(self):
+        webdav = FakeWebDAV()
+        entry = FileEntry("Movie.zh-Hans.srt", "Movie.zh-Hans.srt", "file", 20)
+        webdav.sidecar_entries = [entry]
+        webdav.sidecar_data[entry.path] = "1\n00:00:01,000 --> 00:00:02,000\n你好\n\n".encode()
+        opensubtitles = FakeOpenSubtitles("en")
+
+        def translator(source, destination, _, **options):
+            self.assertEqual(options["subtitle_mode"], "minimalistic")
+            destination.write_text("[Script Info]\n", encoding="utf-8", newline="\n")
+            return {"promptTokens": 1, "completionTokens": 1, "totalTokens": 2}
+
+        result = process_video(
+            "Movie.mkv",
+            config(),
+            webdav,
+            opensubtitles,
+            lambda *_: None,
+            syncer=copy_sync,
+            translator=translator,
+            subtitle_mode="minimalistic",
+        )
+
+        self.assertEqual(opensubtitles.languages, ("en",))
+        self.assertEqual(result["outputPath"], "Movie.minimal.zh-Hans.ass")
+        self.assertEqual(webdav.uploads[result["outputPath"]], b"[Script Info]\n")
+
+    def test_minimalistic_sidecar_is_not_reused_as_complete_target_subtitles(self):
+        source = FakeWebDAV()
+        name = "Movie.minimal.zh-Hans.ass"
+        source.sidecar_entries = [FileEntry(name, name, "file", 20)]
+        self.assertEqual(detect_sidecar_language_from_name("Movie.mkv", name), "zh-cn+en")
+        def translator(source, destination, _config, **_options):
+            shutil.copyfile(source, destination)
+            return {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
+        result = process_video("Movie.mkv", config(), source, FakeOpenSubtitles("en"), lambda *_: None,
+                               syncer=copy_sync, translator=translator, subtitle_mode="target")
+        self.assertNotIn("existing", result)
+        self.assertEqual(result["outputPath"], "Movie.zh-Hans.srt")
+
+    def test_minimalistic_requests_only_english_embedded_tracks_and_numbers_flat_ass_output(self):
+        from backend.embedded_subtitles import EmbeddedSubtitle
+
+        source = FakeWebDAV()
+        requested = []
+        def embedded(_path, languages):
+            requested.append(languages)
+            return EmbeddedSubtitle("en", "Full dialogue", SRT)
+        source.embedded_subtitle = embedded
+        destination = FakeWebDAV()
+        destination.exists = lambda path: path == "Movie.minimal.zh-Hans.ass"
+        def translator(_source, output, _config, **options):
+            self.assertEqual(options["subtitle_mode"], "minimalistic")
+            output.write_text("[Script Info]\n", encoding="utf-8", newline="\n")
+            return {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
+        result = process_video("Movie.mkv", config(), source, FakeOpenSubtitles("en"), lambda *_: None,
+                               translator=translator, subtitle_mode="minimalistic", destination=destination,
+                               flat_output=True)
+        self.assertEqual(requested, [("en",)])
+        self.assertEqual(result["outputPath"], "Movie.minimal (1).zh-Hans.ass")
+        self.assertEqual(destination.uploads[result["outputPath"]], b"[Script Info]\n")
+
     def test_existing_english_sidecar_is_translated_to_language_output(self):
         webdav = FakeWebDAV()
         entry = FileEntry("Movie.en.srt", "Movie.en.srt", "file", len(SRT))
@@ -967,7 +1037,7 @@ class PipelineTests(unittest.TestCase):
                 raise AssertionError("Existing English must skip OpenSubtitles")
 
         def translator(source, destination, _, **__):
-            destination.write_text(source.read_text() + "\nTranslated", encoding="utf-8")
+            destination.write_text(source.read_text(encoding="utf-8") + "\nTranslated", encoding="utf-8")
             return {"promptTokens": 1, "completionTokens": 1, "totalTokens": 2}
 
         result = process_video(
@@ -1060,7 +1130,7 @@ class PipelineTests(unittest.TestCase):
         webdav = FakeWebDAV()
 
         def translator(source, destination, _, **__):
-            destination.write_text(source.read_text() + "\nTranslated", encoding="utf-8")
+            destination.write_text(source.read_text(encoding="utf-8") + "\nTranslated", encoding="utf-8")
             return {"promptTokens": 10, "completionTokens": 5, "totalTokens": 15}
 
         opensubtitles = FakeOpenSubtitles("en")
@@ -1420,6 +1490,89 @@ class FakeAI:
 
 
 class TranslationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        load_frequency_data()
+
+    def test_minimalistic_selects_rare_words_and_positions_glosses(self):
+        data = frequency_data()
+        _, candidates = minimal_candidates(
+            "The path ahead is treacherous, but the view is breathtaking.",
+            data,
+            2000,
+        )
+        terms = {candidate["text"] for candidate in candidates}
+        self.assertIn("treacherous", terms)
+        self.assertIn("breathtaking", terms)
+        self.assertNotIn("path", terms)
+
+        class MinimalCompletions:
+            def __init__(self):
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                requested = json.loads(kwargs["messages"][1]["content"])["cues"]
+                translations = []
+                for row in requested:
+                    selected = [candidate for candidate in row["candidates"] if candidate["text"] in {"treacherous", "breathtaking"}]
+                    translations.append({
+                        "id": row["id"],
+                        "glosses": [
+                            {"candidate": candidate["id"], "text": "险峻的" if candidate["text"] == "treacherous" else "令人惊叹的"}
+                            for candidate in selected
+                        ],
+                    })
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"translations": translations})))],
+                    usage=SimpleNamespace(prompt_tokens=8, completion_tokens=4, total_tokens=12),
+                )
+
+        completions = MinimalCompletions()
+        fake = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        source_text = "1\n00:00:01,000 --> 00:00:03,000\nThe path ahead is treacherous,\nbut the view is breathtaking.\n\n"
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "in.srt"
+            output = Path(directory) / "out.ass"
+            source.write_text(source_text, encoding="utf-8")
+            usage = translate_srt(source, output, config(), fake, subtitle_mode="minimalistic", frequency=data)
+            rendered = output.read_text(encoding="utf-8")
+
+        self.assertEqual(usage["totalTokens"], 12)
+        self.assertIn("[V4+ Styles]", rendered)
+        self.assertIn("险峻的", rendered)
+        self.assertIn("令人惊叹的", rendered)
+        self.assertIn("treacherous, but", rendered)
+        base_lines = [line for line in rendered.splitlines() if line.startswith("Dialogue: 0")]
+        gloss_lines = [line for line in rendered.splitlines() if line.startswith("Dialogue: 1")]
+        self.assertEqual(len(base_lines), 1)
+        self.assertEqual(len(gloss_lines), 2)
+        base_x = base_lines[0].partition(r"\pos(")[2].partition(",")[0]
+        self.assertTrue(all(",English," in line and rf"\an4\pos({base_x}," in line for line in gloss_lines))
+        self.assertTrue(all("The path ahead is " in line and ", but the view is " in line for line in gloss_lines))
+        self.assertIn(r"\fscx220\fscy58}险峻的", rendered)
+        self.assertIn(r"\fscx144\fscy58}令人惊叹的", rendered)
+        self.assertEqual(completions.calls[0]["response_format"]["json_schema"]["name"], "subtitle_glosses")
+
+    def test_minimalistic_skips_ai_when_every_word_is_common(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "in.srt"
+            output = Path(directory) / "out.ass"
+            source.write_text("1\n00:00:01,000 --> 00:00:03,000\nI am here.\n\n", encoding="utf-8")
+            usage = translate_srt(
+                source,
+                output,
+                config(),
+                SimpleNamespace(chat=None),
+                subtitle_mode="minimalistic",
+                frequency=frequency_data(),
+            )
+            rendered = output.read_text(encoding="utf-8")
+
+        self.assertEqual(usage["totalTokens"], 0)
+        self.assertIn("I am here.", rendered)
+        self.assertNotIn("Dialogue: 1", rendered)
+
     def test_chat_completions_shape_and_bilingual_output(self):
         fake = FakeAI()
         with tempfile.TemporaryDirectory() as directory, patch("backend.app.OpenAI", return_value=fake) as factory:
@@ -1502,7 +1655,7 @@ class TranslationTests(unittest.TestCase):
             source.write_bytes(SRT)
             with patch.object(fake.chat.completions, "create", side_effect=empty_once):
                 usage = translate_srt(source, output, config(), fake)
-            self.assertTrue(all("你好。" in cue.content for cue in srt.parse(output.read_text())))
+            self.assertTrue(all("你好。" in cue.content for cue in srt.parse(output.read_text(encoding="utf-8"))))
         self.assertEqual(len(fake.chat.completions.calls), 2)
         self.assertEqual(usage["totalTokens"], 36)
         retry_prompt = fake.chat.completions.calls[1]["messages"][0]["content"]
@@ -1534,7 +1687,7 @@ class TranslationTests(unittest.TestCase):
             source.write_text(srt.compose(original, reindex=False))
             with patch.object(fake.chat.completions, "create", side_effect=translate):
                 usage = translate_srt(source, output, config(), fake, subtitle_mode="bilingual")
-            rendered = list(srt.parse(output.read_text()))
+            rendered = list(srt.parse(output.read_text(encoding="utf-8")))
         self.assertEqual(len(rendered), 23)
         self.assertEqual(usage["totalTokens"], 3 * 18)
         requests = sorted((json.loads(c["messages"][1]["content"]) for c in fake.chat.completions.calls),
@@ -1566,7 +1719,7 @@ class TranslationTests(unittest.TestCase):
             ]))
             with patch.object(fake.chat.completions, "create", side_effect=reject_batches):
                 usage = translate_srt(source, output, config(), fake)
-            self.assertEqual(len(list(srt.parse(output.read_text()))), 4)
+            self.assertEqual(len(list(srt.parse(output.read_text(encoding="utf-8")))), 4)
         sizes = [len(json.loads(call["messages"][1]["content"])["cues"]) for call in fake.chat.completions.calls]
         self.assertEqual(sizes, [4, 4, 4, 2, 2, 2, 1, 1, 2, 2, 2, 1, 1])
         self.assertEqual(usage["totalTokens"], len(sizes) * 18)
