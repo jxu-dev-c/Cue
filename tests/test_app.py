@@ -183,7 +183,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(len(response["options"]["target_languages"]), 20)
             self.assertEqual(response["options"]["subtitle_modes"][-1], {"value": "minimalistic", "label": "Minimalistic"})
             self.assertTrue(all(response["secrets"].values()))
-            config_text = (Path(directory) / "config.json").read_text()
+            config_text = (Path(directory) / "config.json").read_text(encoding="utf-8")
             saved_config = json.loads(config_text)
             self.assertEqual(saved_config["webdav_password"], "webdav-secret")
             self.assertEqual(saved_config["opensubtitles_api_key"], "subtitle-key")
@@ -192,14 +192,14 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("openai_api_key", response["values"])
             if os.name != "nt":
                 self.assertEqual((Path(directory) / "config.json").stat().st_mode & 0o777, 0o600)
-            env_text = (Path(directory) / ".env").read_text()
+            env_text = (Path(directory) / ".env").read_text(encoding="utf-8")
             self.assertNotIn("OPENAI_API_KEY", env_text)
             self.assertIn("UNRELATED=value", env_text)
             if os.name != "nt":
                 self.assertEqual((Path(directory) / ".env").stat().st_mode & 0o777, 0o600)
 
             update_settings(SettingsRequest(values=values, clear_secrets=["opensubtitles_password"]))
-            self.assertNotIn("opensubtitles_password", json.loads((Path(directory) / "config.json").read_text()))
+            self.assertNotIn("opensubtitles_password", json.loads((Path(directory) / "config.json").read_text(encoding="utf-8")))
             with self.assertRaises(HTTPException) as raised:
                 update_settings(SettingsRequest(values=values | {"unknown": "value"}))
             self.assertEqual(raised.exception.status_code, 400)
@@ -948,7 +948,7 @@ class PipelineTests(unittest.TestCase):
 
         def translator(source, destination, _, **options):
             self.assertEqual(options["subtitle_mode"], "bilingual")
-            destination.write_text(source.read_text() + "\nTranslated", encoding="utf-8")
+            destination.write_text(source.read_text(encoding="utf-8") + "\nTranslated", encoding="utf-8")
             return {"promptTokens": 1, "completionTokens": 1, "totalTokens": 2}
 
         result = process_video(
@@ -973,7 +973,7 @@ class PipelineTests(unittest.TestCase):
 
         def translator(source, destination, _, **options):
             self.assertEqual(options["subtitle_mode"], "minimalistic")
-            destination.write_text("[Script Info]\n", encoding="utf-8")
+            destination.write_text("[Script Info]\n", encoding="utf-8", newline="\n")
             return {"promptTokens": 1, "completionTokens": 1, "totalTokens": 2}
 
         result = process_video(
@@ -1017,7 +1017,7 @@ class PipelineTests(unittest.TestCase):
         destination.exists = lambda path: path == "Movie.minimal.zh-Hans.ass"
         def translator(_source, output, _config, **options):
             self.assertEqual(options["subtitle_mode"], "minimalistic")
-            output.write_text("[Script Info]\n", encoding="utf-8")
+            output.write_text("[Script Info]\n", encoding="utf-8", newline="\n")
             return {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
         result = process_video("Movie.mkv", config(), source, FakeOpenSubtitles("en"), lambda *_: None,
                                translator=translator, subtitle_mode="minimalistic", destination=destination,
@@ -1037,7 +1037,7 @@ class PipelineTests(unittest.TestCase):
                 raise AssertionError("Existing English must skip OpenSubtitles")
 
         def translator(source, destination, _, **__):
-            destination.write_text(source.read_text() + "\nTranslated", encoding="utf-8")
+            destination.write_text(source.read_text(encoding="utf-8") + "\nTranslated", encoding="utf-8")
             return {"promptTokens": 1, "completionTokens": 1, "totalTokens": 2}
 
         result = process_video(
@@ -1130,7 +1130,7 @@ class PipelineTests(unittest.TestCase):
         webdav = FakeWebDAV()
 
         def translator(source, destination, _, **__):
-            destination.write_text(source.read_text() + "\nTranslated", encoding="utf-8")
+            destination.write_text(source.read_text(encoding="utf-8") + "\nTranslated", encoding="utf-8")
             return {"promptTokens": 10, "completionTokens": 5, "totalTokens": 15}
 
         opensubtitles = FakeOpenSubtitles("en")
@@ -1536,7 +1536,7 @@ class TranslationTests(unittest.TestCase):
             output = Path(directory) / "out.ass"
             source.write_text(source_text, encoding="utf-8")
             usage = translate_srt(source, output, config(), fake, subtitle_mode="minimalistic", frequency=data)
-            rendered = output.read_text()
+            rendered = output.read_text(encoding="utf-8")
 
         self.assertEqual(usage["totalTokens"], 12)
         self.assertIn("[V4+ Styles]", rendered)
@@ -1567,7 +1567,7 @@ class TranslationTests(unittest.TestCase):
                 subtitle_mode="minimalistic",
                 frequency=frequency_data(),
             )
-            rendered = output.read_text()
+            rendered = output.read_text(encoding="utf-8")
 
         self.assertEqual(usage["totalTokens"], 0)
         self.assertIn("I am here.", rendered)
@@ -1655,7 +1655,7 @@ class TranslationTests(unittest.TestCase):
             source.write_bytes(SRT)
             with patch.object(fake.chat.completions, "create", side_effect=empty_once):
                 usage = translate_srt(source, output, config(), fake)
-            self.assertTrue(all("你好。" in cue.content for cue in srt.parse(output.read_text())))
+            self.assertTrue(all("你好。" in cue.content for cue in srt.parse(output.read_text(encoding="utf-8"))))
         self.assertEqual(len(fake.chat.completions.calls), 2)
         self.assertEqual(usage["totalTokens"], 36)
         retry_prompt = fake.chat.completions.calls[1]["messages"][0]["content"]
@@ -1687,7 +1687,7 @@ class TranslationTests(unittest.TestCase):
             source.write_text(srt.compose(original, reindex=False))
             with patch.object(fake.chat.completions, "create", side_effect=translate):
                 usage = translate_srt(source, output, config(), fake, subtitle_mode="bilingual")
-            rendered = list(srt.parse(output.read_text()))
+            rendered = list(srt.parse(output.read_text(encoding="utf-8")))
         self.assertEqual(len(rendered), 23)
         self.assertEqual(usage["totalTokens"], 3 * 18)
         requests = sorted((json.loads(c["messages"][1]["content"]) for c in fake.chat.completions.calls),
@@ -1719,7 +1719,7 @@ class TranslationTests(unittest.TestCase):
             ]))
             with patch.object(fake.chat.completions, "create", side_effect=reject_batches):
                 usage = translate_srt(source, output, config(), fake)
-            self.assertEqual(len(list(srt.parse(output.read_text()))), 4)
+            self.assertEqual(len(list(srt.parse(output.read_text(encoding="utf-8")))), 4)
         sizes = [len(json.loads(call["messages"][1]["content"])["cues"]) for call in fake.chat.completions.calls]
         self.assertEqual(sizes, [4, 4, 4, 2, 2, 2, 1, 1, 2, 2, 2, 1, 1])
         self.assertEqual(usage["totalTokens"], len(sizes) * 18)
